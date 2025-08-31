@@ -2,9 +2,12 @@
 #include <stdlib.h>
 #include <stdint.h> //for unsignted ints
 #include <string.h>
+#include <stdbool.h>
+#include <time.h>
 
 #define SDL_MAIN_HANDLED
 #include <SDL2/SDL.h> //for graphics and input of the game
+#include <SDL2/SDL_ttf.h>  // fonts
 
 FILE *logFile = NULL;
 
@@ -29,11 +32,16 @@ uint8_t* memoryMap[0x10000]; //pointer array for addressable memory for gameboy 
 // 16 bit registers defined using union between 8 bit registers (e.g. BC shares same memory as B and C, so update to either updates BC), little endian order
 typedef union {
     struct {
-        uint8_t C;
-        uint8_t B;
+        uint8_t C; //low byte
+        uint8_t B; //high byte
     };
     uint16_t BC;
 } RegBC;
+
+//union so struct and uint16_t share same memory
+//struct assigns C to first byte in 16 bit allocated for struct, B to second byte
+//uint16_t uses little endian order (highest memory = start of value), so C is the low byte (e.g. addr 100) and B is the high byte (addr 101) and since union same address as BC
+// allows to access the registers as 8 bit or 16 bit values
 
 typedef union {
     struct {
@@ -75,7 +83,7 @@ CPUReg CPUreg; //global variable for CPU registers
 
 uint8_t cartridge[0x800000] = {0}; // up to 8MB ROM
 uint8_t vram[0x2000] = {0};        // 8KB Video RAM
-uint8_t eram[0x2000] = {0};        // 8KB External RAM
+uint8_t eram[0x2000 * 16] = {0}; // up to 16 banks      // 8KB External RAM
 uint8_t wram[0x2000] = {0};        // 8KB Work RAM
 uint8_t oam[0xA0] = {0};           // 160 bytes OAM
 uint8_t hram[0x7F] = {0};          // 127 bytes High RAM
@@ -139,7 +147,7 @@ void initReg() { //inialise CPU and other reg to values after boot sequence
     *memoryMap[0xFF00] = 0xCF; // set joypad register to 0xCF 
     *memoryMap[0xFF01] = 0x00; // set serial transfer data register to 0
     *memoryMap[0xFF02] = 0x7E; // set serial transfer control register to 0x7E
-    *memoryMap[0xFF04] = 0x18; // set timer counter to 0x18
+    *memoryMap[0xFF04] = 0xAB; // set timer counter to 0xAB
     *memoryMap[0xFF05] = 0x00; // set timer modulo to 0
     *memoryMap[0xFF06] = 0x00; // set timer control to 0
     *memoryMap[0xFF07] = 0xF8; // set timer control to 0xF8
@@ -166,7 +174,7 @@ void initReg() { //inialise CPU and other reg to values after boot sequence
     *memoryMap[0xFF25] = 0xF3; // 
     *memoryMap[0xFF26] = 0xF1; // set LCDC to 0xF8 (LCD enabled, window enabled, sprite size 8x8)
     *memoryMap[0xFF40] = 0x91; // set LCDC to 0x91 (LCD enabled, window enabled, sprite size 8x8)
-    *memoryMap[0xFF41] = 0x80 | 0x02; // STAT: Mode 2 + LY=LYC interrupt off
+    *memoryMap[0xFF41] = 0x85; // STAT: set to 0x85 (mode 1, LY=0, LYC=0, OAM=1, VBlank=1)
     *memoryMap[0xFF42] = 0x00; // set scroll Y to 0
     *memoryMap[0xFF43] = 0x00; // set scroll X to 0
     *memoryMap[0xFF44] = 0x00; // set LY to 0x00 (LY = 0)   
@@ -188,6 +196,83 @@ void logStackTop() {
     }
 }
 
+
+
+uint8_t mbcType = 0; // MBC type, 0 = no MBC, 1 = MBC1, etc.
+uint8_t totalRomBanks;
+uint8_t totalRamBanks;
+
+uint8_t mbc1_mode = 0; // 0 = ROM banking, 1 = RAM banking
+uint8_t mbc_rom_bank = 1;   // shared between MBC1/MBC3
+uint8_t mbc_ram_enable = 0;
+uint8_t mbc_ram_bank = 0;   // for MBC1 (mode=1) or MBC3
+
+uint8_t mbc3_rtc_regs[5];   // 08–0C
+uint8_t mbc3_rtc_latch = 0;
+uint8_t mbc3_rtc_selected = 0xFF;
+
+void updateERAMMapping() {
+    if (mbcType == 1) {
+        // --- MBC1 ---
+        uint32_t ram_offset = mbc_ram_bank * 0x2000;
+        for (int i = 0xA000; i <= 0xBFFF; i++) {
+            memoryMap[i] = (mbc_ram_enable && totalRamBanks > 0)
+                         ? &eram[ram_offset + (i - 0xA000)]
+                         : &unusable[0];
+        }
+    }
+    else if (mbcType == 3) {
+        // --- MBC3 ---
+        if (mbc_ram_bank <= 0x03 && totalRamBanks > 0) {
+            uint32_t ram_offset = mbc_ram_bank * 0x2000;
+            for (int i = 0xA000; i <= 0xBFFF; i++) {
+                memoryMap[i] = mbc_ram_enable
+                             ? &eram[ram_offset + (i - 0xA000)]
+                             : &unusable[0];
+            }
+        }
+        else if (mbc_ram_bank >= 0x08 && mbc_ram_bank <= 0x0C) {
+            // RTC registers → not actual RAM, must be trapped in read/write
+            for (int i = 0xA000; i <= 0xBFFF; i++) {
+                memoryMap[i] = &unusable[0];
+            }
+        }
+        else {
+            // No RAM selected
+            for (int i = 0xA000; i <= 0xBFFF; i++) {
+                memoryMap[i] = &unusable[0];
+            }
+        }
+    }
+    else {
+        // No MBC (or unsupported)
+        for (int i = 0xA000; i <= 0xBFFF; i++)
+            memoryMap[i] = &unusable[0];
+    }
+}
+
+void saveSRAM(const char *romname) {
+    if (totalRamBanks == 0) return; // no SRAM
+    char savename[256];
+    snprintf(savename, sizeof(savename), "%s.sav", romname);
+    FILE *f = fopen(savename, "wb");
+    if (f) {
+        fwrite(eram, 1, totalRamBanks * 0x2000, f);
+        fclose(f);
+    }
+}
+
+void loadSRAM(const char *romname) {
+    if (totalRamBanks == 0) return;
+    char savename[256];
+    snprintf(savename, sizeof(savename), "%s.sav", romname);
+    FILE *f = fopen(savename, "rb");
+    if (f) {
+        fread(eram, 1, totalRamBanks * 0x2000, f);
+        fclose(f);
+    }
+}
+
 void loadrom(const char *namerom) {
     FILE *romFile = fopen(namerom, "rb");
     if (!romFile) {
@@ -206,7 +291,498 @@ void loadrom(const char *namerom) {
     }
     fread(cartridge, 1, romSize , romFile);
     fclose(romFile);
+    switch(cartridge[0x0147]) {
+        case 0x00: mbcType = 0; break; // ROM only
+        case 0x01:
+        case 0x02:
+        case 0x03: mbcType = 1; break; // MBC1
+        case 0x05:
+        case 0x06: mbcType = 2; break; // MBC2
+        case 0x0F:
+        case 0x10:
+        case 0x11:
+        case 0x12:
+        case 0x13: mbcType = 3; break; // MBC3
+        case 0x19:
+        case 0x1A:
+        case 0x1B:
+        case 0x1C:
+        case 0x1D:
+        case 0x1E: mbcType = 5; break; // MBC5
+        default: mbcType = 0; break; // fallback
+}
+        // --- Compute total ROM banks ---
+    uint8_t romSizeByte = cartridge[0x0148];
+    if (romSizeByte <= 0x06)
+        totalRomBanks = 2 << romSizeByte;
+    else if (romSizeByte == 0x52)
+        totalRomBanks = 72;
+    else if (romSizeByte == 0x53)
+        totalRomBanks = 80;
+    else if (romSizeByte == 0x54)
+        totalRomBanks = 96;
+    else
+        totalRomBanks = 128; // fallback
+
+    // --- Compute total RAM banks ---
+    uint8_t ramSizeByte = cartridge[0x0149];
+    switch(ramSizeByte) {
+        case 0x00: totalRamBanks = 0; break;
+        case 0x01: totalRamBanks = 1; break; // 2 KB
+        case 0x02: totalRamBanks = 1; break; // 8 KB
+        case 0x03: totalRamBanks = 4; break; // 32 KB
+        case 0x04: totalRamBanks = 16; break; // 128 KB
+        case 0x05: totalRamBanks = 8; break;  // 64 KB
+        default:   totalRamBanks = 0; break;
+    }
+
+    updateERAMMapping();
+    loadSRAM("Tetris"); // load SRAM if available
+}
+
+
+/* rom header big Endian
+0x0100-0x0103	4	Entry Point	Initial CPU instructions executed on boot
+0x0104-0x0133	48	Nintendo Logo Bitmap	Must match official logo for cartridge to boot
+0x0134-0x0143	16	Title	Game title (up to 16 characters)
+0x0144-0x0145	2	Manufacturer Code	Usually 4-character code (some newer carts)
+0x0146	1	CGB Flag	Indicates if game supports Game Boy Color
+0x0147	1	Cartridge Type (MBC Type)	Indicates MBC, RAM, battery, etc.
+0x0148	1	rom Size	Number of rom banks (code size indicator)
+0x0149	1	RAM Size	External RAM size in cartridge
+0x014A	1	Destination Code	0 = Japanese, 1 = Non-Japanese
+0x014B	1	Old Licensee Code	Deprecated licensee identifier
+0x014C	1	Mask rom Version Number	Version of the cartridge
+0x014D	1	Header Checksum	Checksum of the header bytes 0x0134-0x014C
+0x014E-0x014F	2	Global Checksum	Checksum of entire rom
+*/
+
+void printromHeader() { // for debug
+    printf("rom Header Information:\n");
+    printf("Entry Point: ");
+    for (int i = 0x0100; i <= 0x0103; i++) {
+        printf("%02X ", *memoryMap[i]);
+    }
+    printf("\nNintendo Logo: ");
+    for (int i = 0x0104; i <= 0x0133; i++) {
+        printf("%02X ", *memoryMap[i]);
+    }
+    printf("\nTitle: ");
+    for (int i = 0x0134; i <= 0x0143; i++) {
+        if (*memoryMap[i] >= 32 && *memoryMap[i] <= 126)
+            printf("%c", *memoryMap[i]);
+        else
+            printf(".");
+    }
+    printf("\nManufacturer Code: ");
+    for (int i = 0x0144; i <= 0x0145; i++) {
+        printf("%c", *memoryMap[i]);
+    }
+    printf("\nCGB Flag: 0x%02X\n", *memoryMap[0x0146]);
+    printf("Cartridge Type: 0x%02X\n", *memoryMap[0x0147]);
+    printf("rom Size: 0x%02X\n", *memoryMap[0x0148]);
+    printf("Actual rom file size: %ld bytes\n", romSize); 
+    printf("RAM Size: 0x%02X\n", *memoryMap[0x0149]);
+    printf("Destination Code: 0x%02X\n", *memoryMap[0x014A]);
+    printf("Old Licensee Code: 0x%02X\n", *memoryMap[0x014B]);
+    printf("Mask rom Version: 0x%02X\n", *memoryMap[0x014C]);
+    printf("Header Checksum: 0x%02X\n", *memoryMap[0x014D]);
+    printf("Global Checksum: 0x%02X%02X\n", *memoryMap[0x014E], *memoryMap[0x014F]);
+}
+
+uint64_t cyclesAccumulated = 0; //T Cycles accumulated, one M cycle = 4 T cycles
+
+
+void updateBanks() {
+    // --- ROM bank 0 ---
+    for (int i = 0x0000; i <= 0x3FFF; i++)
+        memoryMap[i] = &cartridge[i];
+
+    // --- Switchable ROM bank ---
+    uint8_t bank = mbc_rom_bank & 0x7F;
+    if (bank == 0) bank = 1;
+    if (bank >= totalRomBanks) bank %= totalRomBanks;
+
+    uint32_t rom_offset = bank * 0x4000;
+    for (int i = 0x4000; i <= 0x7FFF; i++)
+        memoryMap[i] = &cartridge[rom_offset + (i - 0x4000)];
+
+    // --- External RAM / RTC ---
+    if (mbcType == 1) { // MBC1
+        uint8_t ram_bank = 0;
+        if (mbc1_mode) {
+            if (mbc_ram_bank < totalRamBanks)
+                ram_bank = mbc_ram_bank;
+        }
+        uint32_t ram_offset = ram_bank * 0x2000;
+        for (int i = 0xA000; i <= 0xBFFF; i++)
+            memoryMap[i] = (mbc_ram_enable && totalRamBanks > 0)
+                         ? &eram[ram_offset + (i - 0xA000)]
+                         : &unusable[0];
+    }
+    else if (mbcType == 3) { // MBC3
+        if (mbc_ram_bank <= 0x03 && totalRamBanks > 0) {
+            uint32_t ram_offset = mbc_ram_bank * 0x2000;
+            for (int i = 0xA000; i <= 0xBFFF; i++)
+                memoryMap[i] = mbc_ram_enable
+                             ? &eram[ram_offset + (i - 0xA000)]
+                             : &unusable[0];                                                
+        } else if (mbc_ram_bank >= 0x08 && mbc_ram_bank <= 0x0C) {
+            // Map RTC registers (fake: reads/writes handled manually)
+            for (int i = 0xA000; i <= 0xBFFF; i++)
+                memoryMap[i] = &unusable[0]; // trap accesses
+        } else {
+            for (int i = 0xA000; i <= 0xBFFF; i++)
+                memoryMap[i] = &unusable[0];
+        }
+    }
+}
+
+void handleMBCWrite(uint16_t addr, uint8_t value) {
+    if (mbcType == 1) {
+        if (addr <= 0x1FFF) {
+            mbc_ram_enable = ((value & 0x0F) == 0x0A);
+            updateBanks();
+        }
+        else if (addr <= 0x3FFF) {
+            mbc_rom_bank = (mbc_rom_bank & 0x60) | (value & 0x1F);
+            if ((mbc_rom_bank & 0x1F) == 0) mbc_rom_bank |= 1;
+            updateBanks();
+        }
+        else if (addr <= 0x5FFF) {
+            uint8_t upper2 = value & 0x03;
+            if (mbc1_mode)
+                mbc_ram_bank = upper2;
+            else {
+                mbc_rom_bank = (mbc_rom_bank & 0x1F) | (upper2 << 5);
+                if ((mbc_rom_bank & 0x7F) == 0) mbc_rom_bank |= 1;
+            }
+            updateBanks();
+        }
+        else if (addr <= 0x7FFF) {
+            mbc1_mode = value & 0x01;
+            updateBanks();
+        }
+    }
+    else if (mbcType == 3) {
+        if (addr <= 0x1FFF) {
+            mbc_ram_enable = ((value & 0x0F) == 0x0A);                                                          
+            updateBanks();
+        }
+        else if (addr <= 0x3FFF) {
+            mbc_rom_bank = value & 0x7F;
+            if (mbc_rom_bank == 0) mbc_rom_bank = 1;
+            updateBanks();
+        }
+        else if (addr <= 0x5FFF) {
+            mbc_ram_bank = value;  // 0–3 = RAM, 08–0C = RTC
+            updateBanks();
+        }
+        else if (addr <= 0x7FFF) {
+            if (mbc3_rtc_latch == 0 && value == 1) { //only triggers when going from 0 to 1
+                // Latch RTC registers from system clock
+                time_t t = time(NULL);
+                struct tm *tm = localtime(&t);
+
+                mbc3_rtc_regs[0] = tm->tm_sec;        // seconds
+                mbc3_rtc_regs[1] = tm->tm_min;        // minutes
+                mbc3_rtc_regs[2] = tm->tm_hour;       // hours
+                mbc3_rtc_regs[3] = tm->tm_mday & 0xFF; // lower 8 bits of day
+                mbc3_rtc_regs[4] = ((tm->tm_yday & 0x01) << 0) | 0; // upper day bit, control flags = 0    
+                }
+            mbc3_rtc_latch = value;
+            }
+        }
+    }
     
+
+uint8_t buttonState = 0xFF; // All buttons released (bits 0–7 high)
+
+uint8_t readJoypad(uint8_t select) {
+    // select: current value at 0xFF00 (written by CPU)
+    uint8_t result = 0xCF; // Upper bits default to 1, bits 4 & 5 control selection
+    result |= (select & 0x30); // preserve select bits
+
+    if (!(select & (1 << 4))) {
+        result &= (0xF0 | (buttonState & 0x0F));
+    }
+    if (!(select & (1 << 5))) {
+        result &= (0xF0 | ((buttonState >> 4) & 0x0F));
+    }
+
+    return result;
+}
+
+void handleButtonPress(SDL_Event *event) {
+    int pressed = (event->type == SDL_KEYDOWN) ? 0 : 1;
+    uint8_t prevState = buttonState;
+
+    switch (event->key.keysym.sym) {
+        // D-pad (P14 group)
+        case SDLK_w: if (pressed) buttonState |= (1 << 2); else buttonState &= ~(1 << 2); break; // Up
+        case SDLK_s: if (pressed) buttonState |= (1 << 3); else buttonState &= ~(1 << 3); break; // Down
+        case SDLK_a: if (pressed) buttonState |= (1 << 1); else buttonState &= ~(1 << 1); break; // Left
+        case SDLK_d: if (pressed) buttonState |= (1 << 0); else buttonState &= ~(1 << 0); break; // Right
+
+        // Action buttons (P15 group)
+        case SDLK_v: if (pressed) buttonState |= (1 << 4); else buttonState &= ~(1 << 4); break; // A
+        case SDLK_c: if (pressed) buttonState |= (1 << 5); else buttonState &= ~(1 << 5); break; // B
+        case SDLK_r: if (pressed) buttonState |= (1 << 6); else buttonState &= ~(1 << 6); break; // Select
+        case SDLK_f: if (pressed) buttonState |= (1 << 7); else buttonState &= ~(1 << 7); break; // Start
+    }
+
+    // Update 0xFF00 using correct readJoypad behavior
+    *memoryMap[0xFF00] = readJoypad(*memoryMap[0xFF00]);
+
+    // If a new button was pressed (bit changed from 1 → 0), request joypad interrupt
+    if ((prevState & ~buttonState) & 0xFF) {
+        *memoryMap[0xFF0F] |= 0x10; // Bit 4: Joypad interrupt
+    }
+}
+
+int DMAFlag = 0; // DMA transfer flag, 0 = no transfer, 1 = transfer in progress
+int DMAcycles = 0; // DMA cycles remaining, 0 = no transfer in progress
+int LCDdisabled = 0; // LCD disabled flag, 0 = enabled, 1 = disabled
+int LCDdelayflag = -1; // LCD delay flag for turning back on, set to -1 so no mode2 switch on startup ppu
+
+    int scanlineTimer = 0; // amount of cycles for scanline
+    int mode0Timer = 0; // amount of cycles for Hblank
+    int mode1Timer = 120; // amount of cycles for Vblank
+    int mode2Timer = 0;
+    int mode3Timer = 0; // amount of cycles needed to start next operation
+
+    int xPos = 0;
+    int scxCounter = 0;
+    int newScanLine = 1;
+
+typedef struct {
+    uint8_t colour;
+    uint8_t palette;
+    int bg_priority;
+    int is_sprite;
+    uint8_t sprite_index;
+} Pixel;
+
+typedef struct {
+    Pixel data[8]; // array to store queue elements
+    int count;  // number of elements in the queue
+}Queue; //Use for FIFO
+
+// Initialize queue
+void initQueue(Queue* q) {
+    q->count = 0;
+}
+
+// Check if empty
+int isEmpty(Queue* q) {
+    return q->count == 0;
+}
+
+// Check if full
+int isFull(Queue* q) {
+    return q->count == 8;
+}
+
+// Enqueue value
+int enqueue(Queue* q, Pixel pixel) {
+    if (isFull(q)) return 1;
+    q->data[q->count++] = pixel;
+    //printf("Enqueued pixel, new count=%d\n", q->count);
+    return 0;
+}
+
+// Dequeue and shift
+int dequeue(Queue* q, Pixel* pixel) {
+    if (isEmpty(q)) return 0;
+
+    *pixel = q->data[0];
+
+    // Shift elements
+    for (int i = 1; i < q->count; i++) {
+        q->data[i - 1] = q->data[i];
+    }
+
+    q->count--;
+    return 1;
+}
+
+typedef struct {
+    int BGFetchStage; //background
+    int objectFetchStage; //sprite
+    int windowFetchMode; //window 
+} FetchStage;
+
+    FetchStage fetchStage = {
+        .objectFetchStage = 0,
+        .BGFetchStage = 0,
+        .windowFetchMode = 0 //starting from 0 means initialise fetch mode for window and clear BGFifo, and fetcher stages
+    };
+    Queue BGFifo = {
+        .count = 0
+    };
+    Queue SpriteFifo = {
+        .count = 0
+    };
+
+int realCyclesAccumulated = 0; //reset cycles accumulated
+
+void LDVal8(uint8_t value, uint8_t *dest, uint16_t addr, bool isMemory, uint16_t src) {
+
+        if (addr == 0xFF40) {
+        printf(">>> LCDC WRITE: %02X at PC=%04X\n", value, CPUreg.PC);
+    }
+
+
+
+
+
+    uint8_t mode = *memoryMap[0xFF41] & 0x03; //PPU mode (0 = HBlank, 1 = VBlank, 2 = OAM, 3 = Transfer)
+    if(addr == 0xFF40 && (value >> 7) == 0) { // If LCDC is disabled, reset LY to 0
+        *memoryMap[0xFF44] = 0; // Reset LY to 0
+        *memoryMap[0xFF41] = (*memoryMap[0xFF41] & ~0x03) | 0x00; // Set mode to 0 (HBlank)
+        *memoryMap[0xFF41] &= ~(1 << 2); // Coincidence flag cleared (unless LY==LYC)
+        mode0Timer = 0;
+        mode1Timer = 0;
+        mode2Timer = 0;
+        scanlineTimer = 0;
+        xPos = 0;
+        LCDdisabled = 1; // Set LCD disabled flag
+        newScanLine = 1;
+        fetchStage.objectFetchStage = 0; // Reset object fetch stage
+        fetchStage.BGFetchStage = 0; // Reset background fetch stage
+        fetchStage.windowFetchMode = 0; // Reset window fetch mode
+        for (int i = 0; i < 8; i++) { // Clear BGFifo
+            Pixel discard;
+            dequeue(&BGFifo, &discard);
+            dequeue(&SpriteFifo, &discard); // Clear SpriteFifo as well
+    }
+    //fprintf(logFile, "LCDC disabled, cycle: %ld\n", realCyclesAccumulated);
+    *dest = value; // Write value to LCDC
+    return; // Exit early if LCDC is disabled
+}
+
+    if(addr == 0xFF40 && (value >> 7) == 1 && LCDdisabled == 1) { // If LCDC is enabled, reset LY to 
+        LCDdelayflag = 4; // Set LCD delay flag to turn back on
+        //fprintf(logFile, "LCDC delay flag, cycle: %ld\n", realCyclesAccumulated);
+        *dest = value; // Write value to LCDC
+        return; // Exit early if LCDC is enabled
+    }
+
+    if ((src >= 0xA000 && src <= 0xBFFF) && mbcType == 3 && mbc_ram_bank >= 0x08 && mbc_ram_bank <= 0x0C){
+        // Map bank to RTC register index
+        uint8_t rtcIndex = mbc_ram_bank - 0x08;
+        value = mbc3_rtc_regs[rtcIndex];  // Return RTC value 
+    }
+    
+    // Block VRAM writes during Mode 3 (Pixel Transfer)
+    if (addr >= 0x8000 && addr <= 0x9FFF && mode == 3) {
+        return;
+    }
+ 
+    if (src <= 0x9FFF && src >= 0x8000 && mode == 3) {
+        value = 0xFF;
+        // Block read from VRAM during Mode 3
+    }
+        
+    if (src == 0xFF0F) {
+        value |= 0xE0;  // ensure bits 5-7 are 1
+    }
+
+    // Block OAM writes during Mode 2, 3, or DMA
+    if (addr >= 0xFE00 && addr <= 0xFE9F &&(mode == 2 || mode == 3 || DMAFlag == 1)) {
+        return;
+    }
+    if (src >= 0xFE00 && src <= 0xFE9F &&
+        (mode == 2 || mode == 3 || DMAFlag == 1)) {
+        value = 0xFF;
+         // Block read from OAM during Mode 2, 3, or DMA
+    }
+
+
+    if (src == 0xFF00){
+        // Special case for Joypad register
+        value = readJoypad(*memoryMap[0xFF00]);
+    }
+        
+    if (isMemory) {
+        // Intercept ROM writes
+        if (((addr >= 0x0000 && addr <= 0x7FFF) || (addr >= 0xA000 && addr <= 0xBFFF))) {
+            handleMBCWrite(addr,value);
+            // ROM or (external RAM in MBC mode, if not mapped)
+            return;
+        }
+
+        // Block unusable area
+        if (addr >= 0xFEA0 && addr <= 0xFEFF) return;
+
+        // I/O special cases
+        switch (addr) {
+            case 0xFF0F:  // IF
+                // Writes: mask out upper bits
+                *dest = (value & 0x1F) | 0xE0;
+                return;
+            case 0xFFFF:  // IE
+                // Writes: accept all bits (0–4 valid, 5–7 stored)
+                *dest = value;  // no masking to upper bits
+                return;
+            case 0xFF00:  // Joypad
+                // Lower 4 bits are read-only (button state), mask them off
+                *dest = (*dest & 0xCF) | (value & 0x30);  // Keep only bits 4 and 5
+                *memoryMap[0xFF00] = readJoypad(*memoryMap[0xFF00]);
+                return;
+            case 0xFF04:  // DIV (Divider)
+                *dest = 0;  // Writing resets to 0
+                return;
+
+            case 0xFF41:  // STAT
+                // Only bits 3–6 are writable
+                *dest = (*dest & 0x87) | (value & 0x78);
+                return;
+
+            case 0xFF44:  // LY (Current scanline)
+                *dest = 0;
+                printf("0xFF44 Written to (LY)");
+
+                return;
+
+            case 0xFF46:  // DMA transfer request
+
+                DMAFlag = 1;
+                *dest = value; // Store DMA source address
+                uint8_t dmaSource = *memoryMap[0xFF46]; // Get DMA source address
+                uint16_t sourceAddr = dmaSource << 8; // Convert to 16-bit address
+                uint16_t destAddr = 0xFE00; // OAM starts at 0xFE00
+                for (int i = 0; i < 0xA0; i++) { // Transfer 160 bytes (40 sprites * 4 bytes each)
+                    *memoryMap[destAddr + i] = *memoryMap[sourceAddr + i];
+                }
+                DMAcycles = 640; // DMA takes 640 T cycles to complete
+                //getchar(); // Wait for user input to continue
+                //fprintf(logFile, "DMA transfer completed from %02X to OAM\n", dmaSource);
+                //printf("DMA transfer completed from %02X to OAM\n", dmaSource);
+                //cyclesAccumulated += 640; // DMA timing delay
+            
+                 return;
+
+
+            
+
+            // add other I/O special cases here
+
+            
+        }
+
+        // Normal memory write
+        if (dest) *dest = value;
+    } else {
+        // Register write
+        if (dest) *dest = value;
+    }
+}
+
+void LDVal16(uint16_t value, uint16_t *dest) { //load 16-bit value into destination register
+    *dest = value;
+    //cyclesAccumulated += 8; // 8 T cycles for 16-bit load
+    //fprintf(logFile, "[LDVal16] Loaded 0x%04X into %p (PC=%04X) Cycles=%d\n", value, dest, CPUreg.PC, cyclesAccumulated);
 }
 
 // read/write helpers for pointer-based memory map:
@@ -262,87 +838,6 @@ int getCarryFlag() {
     return (CPUreg.af.F & 0x10) != 0;
 }
 
-uint8_t readByte(uint16_t addr) { //address bus 16 bits, data bus 8 bits
-    return *memoryMap[addr];
-}
-void writeByte(uint16_t addr, uint8_t value) {
-    *memoryMap[addr] = value;
-}
-
-/* rom header big Endian
-0x0100-0x0103	4	Entry Point	Initial CPU instructions executed on boot
-0x0104-0x0133	48	Nintendo Logo Bitmap	Must match official logo for cartridge to boot
-0x0134-0x0143	16	Title	Game title (up to 16 characters)
-0x0144-0x0145	2	Manufacturer Code	Usually 4-character code (some newer carts)
-0x0146	1	CGB Flag	Indicates if game supports Game Boy Color
-0x0147	1	Cartridge Type (MBC Type)	Indicates MBC, RAM, battery, etc.
-0x0148	1	rom Size	Number of rom banks (code size indicator)
-0x0149	1	RAM Size	External RAM size in cartridge
-0x014A	1	Destination Code	0 = Japanese, 1 = Non-Japanese
-0x014B	1	Old Licensee Code	Deprecated licensee identifier
-0x014C	1	Mask rom Version Number	Version of the cartridge
-0x014D	1	Header Checksum	Checksum of the header bytes 0x0134-0x014C
-0x014E-0x014F	2	Global Checksum	Checksum of entire rom
-*/
-
-void printromHeader() { // for debug
-    printf("rom Header Information:\n");
-    printf("Entry Point: ");
-    for (int i = 0x0100; i <= 0x0103; i++) {
-        printf("%02X ", *memoryMap[i]);
-    }
-    printf("\nNintendo Logo: ");
-    for (int i = 0x0104; i <= 0x0133; i++) {
-        printf("%02X ", *memoryMap[i]);
-    }
-    printf("\nTitle: ");
-    for (int i = 0x0134; i <= 0x0143; i++) {
-        if (*memoryMap[i] >= 32 && *memoryMap[i] <= 126)
-            printf("%c", *memoryMap[i]);
-        else
-            printf(".");
-    }
-    printf("\nManufacturer Code: ");
-    for (int i = 0x0144; i <= 0x0145; i++) {
-        printf("%c", *memoryMap[i]);
-    }
-    printf("\nCGB Flag: 0x%02X\n", *memoryMap[0x0146]);
-    printf("Cartridge Type: 0x%02X\n", *memoryMap[0x0147]);
-    printf("rom Size: 0x%02X\n", *memoryMap[0x0148]);
-    printf("Actual rom file size: %ld bytes\n", romSize); 
-    printf("RAM Size: 0x%02X\n", *memoryMap[0x0149]);
-    printf("Destination Code: 0x%02X\n", *memoryMap[0x014A]);
-    printf("Old Licensee Code: 0x%02X\n", *memoryMap[0x014B]);
-    printf("Mask rom Version: 0x%02X\n", *memoryMap[0x014C]);
-    printf("Header Checksum: 0x%02X\n", *memoryMap[0x014D]);
-    printf("Global Checksum: 0x%02X%02X\n", *memoryMap[0x014E], *memoryMap[0x014F]);
-}
-
-uint64_t cyclesAccumulated = 0; //T Cycles accumulated, one M cycle = 4 T cycles
-
-
-void LDVal8(uint8_t value, uint8_t *dest) { //load 8-bit value into destination register
-    *dest = value;
-    //cyclesAccumulated += 4; // 4 T cycles for 8-bit load
-    //fprintf(logFile, "[LDVal8] Loaded 0x%02X into %p (PC=%04X) Cycles=%d\n", value, dest, CPUreg.PC, cyclesAccumulated);
-}
-
-void LDVal16(uint16_t value, uint16_t *dest) { //load 16-bit value into destination register
-    *dest = value;
-    //cyclesAccumulated += 8; // 8 T cycles for 16-bit load
-    //fprintf(logFile, "[LDVal16] Loaded 0x%04X into %p (PC=%04X) Cycles=%d\n", value, dest, CPUreg.PC, cyclesAccumulated);
-}
-
-uint8_t RDVal8(uint8_t *dest) { //read 8-bit value from destination register
-    //cyclesAccumulated += 4; // 4 T cycles for 8-bit read
-    return *dest;
-}
-
-uint16_t RDVal16(uint16_t *dest) { //read 16-bit value from destination register
-    //cyclesAccumulated += 8; // 8 T cycles for 16-bit read
-    return *dest;
-}
-
 //Purple instructions
 void op_0x00(){ //increment PC by 1 4T 1PC
     CPUreg.PC += 1;
@@ -353,6 +848,7 @@ void op_0x10(){
     //printf("stop called, not implemented yet\n");
     CPUreg.PC += 2; //increment PC by 1
     cyclesAccumulated += 4; //increment cycles by 4
+    printf("Stop instruction executed, PC incremented to 0x%04X\n", CPUreg.PC);
   } //stop IMPLEMENT LATER
 
 void op_0x20(){ //jump with relative offset if zero flag not set
@@ -373,12 +869,14 @@ void op_0x76() { // HALT
     if (CPUreg.IME == 0 && (IE & IF & 0x1F)) {
         // HALT bug: interrupts disabled, but at least one is pending
         haltMode = 2;
+        cyclesAccumulated += 4;
     } else {
         // Normal halt
         haltMode = 1;
+        cyclesAccumulated += 4;
     }
     CPUreg.PC += 1;
-    cyclesAccumulated += 4;
+    //printf("Halt mode: %d, IE: %02X, IF: %02X, IME: %d\n", haltMode, IE, IF, CPUreg.IME);
 }
 
 
@@ -398,188 +896,109 @@ void op_0xFB(){ //enable interrupts 4T 1PC LOOK INTO CYCLE ACCURATE IMPLEMENTATI
 }
 
 //Orange Jump instructions
-void op_0x30(){ //jump with relative offset if carry flag is not set
-    int carryFlag = CPUreg.af.F & 0x10; // check if carry flag is set
-    if (carryFlag == 0) {
-        CPUreg.PC += 2 + ((int8_t)*memoryMap[CPUreg.PC + 1]); //signed integer added to PC 12T
+void relJumpIf(int condition) {
+    if (condition) {
+        CPUreg.PC += 2 + (int8_t)*memoryMap[CPUreg.PC + 1];
         cyclesAccumulated += 12;
     } else {
-        CPUreg.PC += 2; //increment PC by 2 if carry flag is set
+        CPUreg.PC += 2;
         cyclesAccumulated += 8;
     }
 }
 
-void op_0x28(){ //jump with relative offset if zero flag is set
-    int zeroFlag = CPUreg.af.F & 0x80; // check if zero flag is set
-    //fprintf(logFile,"[DEBUG] JR Z: ZeroFlag=%d, PC=%04X\n", zeroFlag != 0, CPUreg.PC);
-    if (zeroFlag != 0) {
-        CPUreg.PC += 2 + ((int8_t)*memoryMap[CPUreg.PC + 1]); //signed integer added to PC 12T
-        cyclesAccumulated += 12;
-    } else {
-        CPUreg.PC += 2; //increment PC by 2 if zero flag is not set
-        cyclesAccumulated += 8;
-    }
+void op_0x30() { // JR NC, r8
+    relJumpIf(!getCarryFlag());
 }
-
-void op_0x38(){ //jump with relative offset if carry flag is set
-    int carryFlag = CPUreg.af.F & 0x10; // check if carry flag is set
-    if (carryFlag != 0) {
-        CPUreg.PC += 2 + ((int8_t)*memoryMap[CPUreg.PC + 1]); //signed integer added to PC 12T
-        cyclesAccumulated += 12;
-    } else {
-        CPUreg.PC += 2; //increment PC by 2 if carry flag is not set
-        cyclesAccumulated += 8;
-    }
+void op_0x28() { // JR Z, r8
+    relJumpIf(getZeroFlag());
 }
-
-void op_0x18(){ //jump with relative offset 12T 2PC
-    CPUreg.PC += 2 + ((int8_t)*memoryMap[CPUreg.PC + 1]); //signed integer added to PC
-    cyclesAccumulated += 12;
+void op_0x38() { // JR C, r8
+    relJumpIf(getCarryFlag());
 }
-
-void op_0xE9(){ //jump to address in HL register 4T 1PC
-    CPUreg.PC = CPUreg.hl.HL; //set PC to HL value
+void op_0x18() { // JR r8 (unconditional)
+    relJumpIf(1);
+}
+void op_0xE9() { // JP (HL)
+    CPUreg.PC = CPUreg.hl.HL;
     cyclesAccumulated += 4;
-}   
+}
+
 
 //Orange call instructions
 
-void op_0xC4(){ //call subroutine if zero flag not set 24T 3PC
-    int zeroFlag = CPUreg.af.F & 0x80; // check if zero flag is set
-    if (zeroFlag == 0) {
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) >> 8; //push high byte of PC onto stack
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) & 0xFF; //push low byte of PC onto stack
-        CPUreg.PC = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1]; //set PC to address in memory
+void conditionalCall(int condition) {
+    if (condition) {
+        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) >> 8;
+        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) & 0xFF;
+        CPUreg.PC = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1];
         cyclesAccumulated += 24;
     } else {
-        CPUreg.PC += 3; //increment PC by 3 if zero flag is set
-        cyclesAccumulated += 12;
-    }
-    logStackTop(); 
-}
-
-void op_0xCC(){ //call subroutine if zero flag is set 24T 3PC
-    int zeroFlag = CPUreg.af.F & 0x80; // check if zero flag is set
-    if (zeroFlag != 0) {
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) >> 8; //push high byte of PC onto stack
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) & 0xFF; //push low byte of PC onto stack
-        CPUreg.PC = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1]; //set PC to address in memory
-        cyclesAccumulated += 24;
-    } else {
-        CPUreg.PC += 3; //increment PC by 3 if zero flag is not set
+        CPUreg.PC += 3;
         cyclesAccumulated += 12;
     }
     logStackTop();
 }
 
-void op_0xD4(){ //call subroutine if carry flag not set 24T 3PC
-    int carryFlag = CPUreg.af.F & 0x10; // check if carry flag is set
-    if (carryFlag == 0) {
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) >> 8; //push high byte of PC onto stack
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) & 0xFF; //push low byte of PC onto stack
-        CPUreg.PC = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1]; //set PC to address in memory
-        cyclesAccumulated += 24;
-    } else {
-        CPUreg.PC += 3; //increment PC by 3 if carry flag is set
-        cyclesAccumulated += 12;
-    }
-    logStackTop();
+void op_0xC4() { // CALL NZ, a16
+    conditionalCall(!getZeroFlag());
+}
+void op_0xCC() { // CALL Z, a16
+    conditionalCall(getZeroFlag());
+}
+void op_0xD4() { // CALL NC, a16
+    conditionalCall(!getCarryFlag());
+}
+void op_0xDC() { // CALL C, a16
+    conditionalCall(getCarryFlag());
+}
+void op_0xCD() { // CALL a16 (unconditional)
+    conditionalCall(1);
 }
 
-void op_0xDC(){ //call subroutine if carry flag is set 24T 3PC
-    int carryFlag = CPUreg.af.F & 0x10; // check if carry flag is set
-    if (carryFlag != 0) {
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) >> 8; //push high byte of PC onto stack
-        *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) & 0xFF; //push low byte of PC onto stack
-        CPUreg.PC = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1]; //set PC to address in memory
-        cyclesAccumulated += 24;
-    } else {
-        CPUreg.PC += 3; //increment PC by 3 if carry flag is not set
-        cyclesAccumulated += 12;
-    }
-    logStackTop();
-}
-
-void op_0xCD(){ //call subroutine 24T 3PC
-    *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) >> 8; //push high byte of PC onto stack
-    *memoryMap[--CPUreg.SP] = (CPUreg.PC + 3) & 0xFF; //push low byte of PC onto stack
-    CPUreg.PC = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1]; //set PC to address in memory
-    cyclesAccumulated += 24;
-    logStackTop();
-}
 
 //Orange return instructions
 
-void op_0xC9(){ //return from subroutine 16T 1PC
+void conditionalReturn(int condition) {
+    if (condition) {
+        CPUreg.PC = (*memoryMap[CPUreg.SP + 1] << 8) | *memoryMap[CPUreg.SP];
+        CPUreg.SP += 2;
+        cyclesAccumulated += 20;
+    } else {
+        CPUreg.PC += 1;
+        cyclesAccumulated += 8;
+    }
+    logStackTop();
+}
+
+void unconditionalReturn() {
     CPUreg.PC = (*memoryMap[CPUreg.SP + 1] << 8) | *memoryMap[CPUreg.SP]; //set PC to value on stack
     CPUreg.SP += 2; //increment stack pointer by 2
     cyclesAccumulated += 16;
     logStackTop();
+    //printf("Unconditional return to %04X\n", CPUreg.PC);
 }
 
-int realCyclesAccumulated = 0; //reset cycles accumulated
+void op_0xC0() { // RET NZ
+    conditionalReturn(!getZeroFlag());
+}
+void op_0xC8() { // RET Z
+    conditionalReturn(getZeroFlag());
+}
+void op_0xD0() { // RET NC
+    conditionalReturn(!getCarryFlag());
+}
+void op_0xD8() { // RET C
+    conditionalReturn(getCarryFlag());
+}
+void op_0xC9(){ //return from subroutine 16T 1PC
+    unconditionalReturn();
+}
+
 void op_0xD9(){ //return from interrupt 16T 1PC
-    CPUreg.PC = (*memoryMap[CPUreg.SP + 1] << 8) | *memoryMap[CPUreg.SP]; //set PC to value on stack
-    CPUreg.SP += 2; //increment stack pointer by 2
-    CPUreg.IME = 1; //enable interrupts
-    cyclesAccumulated += 16;    
-    logStackTop();
+    unconditionalReturn();
+    CPUreg.IME = 1;
     //printf("RETI: Cycles accumulated: %lu\n", realCyclesAccumulated);
     //fprintf(logFile, "[INTERRUPT Finish] IE=0x%02X IF=0x%02X IME=%d (PC=%04X) Cycles=%d\n", *memoryMap[0xFFFF], *memoryMap[0xFF0F], CPUreg.IME, CPUreg.PC, realCyclesAccumulated);
-    //getchar(); // wait for user input to continue
-}
-
-
-void op_0xC0(){ //return if zero flag not set 20T 2PC
-    int zeroFlag = getZeroFlag(); // check if zero flag is set
-    if (zeroFlag == 0) {
-        CPUreg.PC = (*memoryMap[CPUreg.SP + 1] << 8) | *memoryMap[CPUreg.SP]; //set PC to value on stack
-        CPUreg.SP += 2; //increment stack pointer by 2
-        cyclesAccumulated += 20;
-    } else {
-        CPUreg.PC += 1; //increment PC by 1 if zero flag is set
-        cyclesAccumulated += 8;
-    }
-    logStackTop();
-}
-
-void op_0xD0(){ //return if carry flag not set 20T 2PC
-    int carryFlag = getCarryFlag(); 
-    if (carryFlag == 0) {
-        CPUreg.PC = (*memoryMap[CPUreg.SP + 1] << 8) | *memoryMap[CPUreg.SP]; //set PC to value on stack
-        CPUreg.SP += 2; //increment stack pointer by 2
-        cyclesAccumulated += 20;
-    } else {
-        CPUreg.PC += 1; //increment PC by 1 if carry flag is set
-        cyclesAccumulated += 8;
-    }
-    logStackTop();
-}
-
-void op_0xD8(){ //return if carry flag is set 20T 2PC
-    int carryFlag = getCarryFlag(); // check if carry flag is set
-    if (carryFlag != 0) {
-        CPUreg.PC = (*memoryMap[CPUreg.SP + 1] << 8) | *memoryMap[CPUreg.SP]; //set PC to value on stack
-        CPUreg.SP += 2; //increment stack pointer by 2
-        cyclesAccumulated += 20;
-    } else {
-        CPUreg.PC += 1; //increment PC by 1 if carry flag is not set
-        cyclesAccumulated += 8;
-    }
-    logStackTop();
-}
-
-void op_0xC8(){ //return if zero flag is set 20T 2PC
-    int zeroFlag = getZeroFlag(); // check if zero flag is set
-    if (zeroFlag != 0) {
-        CPUreg.PC = (*memoryMap[CPUreg.SP + 1] << 8) | *memoryMap[CPUreg.SP]; //set PC to value on stack
-        CPUreg.SP += 2; //increment stack pointer by 2
-        cyclesAccumulated += 20;
-    } else {
-        CPUreg.PC += 1; //increment PC by 1 if zero flag is not set
-        cyclesAccumulated += 8;
-    }
-    logStackTop();
 }
 
 //Orange restart instructions
@@ -590,147 +1009,75 @@ void restartTo(uint8_t addr) {
     CPUreg.PC = addr; //set PC to restart address
     cyclesAccumulated += 16;
 }
+
 void op_0xC7(){ //restart 0x00 16T 3PC
     restartTo(0x00);
 }
-
 void op_0xCF(){ //restart 0x08 16T 3PC
     restartTo(0x08);
 }
-
 void op_0xD7(){ //restart 0x10 16T 3PC
     restartTo(0x10);
 }
-
 void op_0xDF(){ //restart 0x18 16T 3PC
     restartTo(0x18);
 }
-
 void op_0xE7(){ //restart 0x20 16T 3PC
     restartTo(0x20);
 }
-
 void op_0xEF(){ //restart 0x28 16T 3PC
     restartTo(0x28);
 }
-
 void op_0xF7(){ //restart 0x30 16T 3PC
     restartTo(0x30);
 }
-
 void op_0xFF(){ //restart 0x38 16T 3PC
     restartTo(0x38);
 }
 
 //Green LD instructions (16bit int into 16 bit register)
-void op_0x01(){ //read 2 bytes from memory and set BC to that value 12T 3PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.bc.C); //read low byte from memory 
-    LDVal8(*memoryMap[CPUreg.PC + 2], &CPUreg.bc.B); //read high byte from memory
-    CPUreg.PC += 3; 
+void loadImm16ToReg(uint8_t *high, uint8_t *low) {
+    *low = *memoryMap[CPUreg.PC + 1];
+    *high = *memoryMap[CPUreg.PC + 2];
+    CPUreg.PC += 3;
     cyclesAccumulated += 12;
 }
 
-void op_0x11(){ //read 2 bytes from memory and set DE to that value 12T 3PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.de.E); //read low byte from memory 
-    LDVal8(*memoryMap[CPUreg.PC + 2], &CPUreg.de.D); //read high byte from memory
-    CPUreg.PC += 3; 
-    cyclesAccumulated += 12;
+void op_0x01() { // LD BC, imm16
+    loadImm16ToReg(&CPUreg.bc.B, &CPUreg.bc.C);
+}
+void op_0x11() { // LD DE, imm16
+    loadImm16ToReg(&CPUreg.de.D, &CPUreg.de.E);
+}
+void op_0x21() { // LD HL, imm16
+    loadImm16ToReg(&CPUreg.hl.H, &CPUreg.hl.L);
 }
 
-void op_0x21(){ //read 2 bytes from memory and set HL to that value 12T 3PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.hl.L); //read low byte from memory 
-    LDVal8(*memoryMap[CPUreg.PC + 2], &CPUreg.hl.H); //read high byte from memory
-    CPUreg.PC += 3; 
-    cyclesAccumulated += 12;
-}
+void op_0x31() { // LD SP, imm16
+    // First load the low byte into the lower 8 bits of SP
+    LDVal8(*memoryMap[CPUreg.PC + 1], ((uint8_t*)&CPUreg.SP), 0xFFFF, 0, CPUreg.PC + 1);
 
-void op_0x31(){ //read 2 bytes from memory and set SP to that value 12T 3PC
-    uint8_t low  = *memoryMap[CPUreg.PC + 1];
-    uint16_t high = *memoryMap[CPUreg.PC + 2];
-    uint16_t value = (high << 8) | low; //shift high and combine with low byte
-    LDVal16(value, &CPUreg.SP);
-    CPUreg.PC += 3; 
+    // Then load the high byte into the upper 8 bits of SP
+    LDVal8(*memoryMap[CPUreg.PC + 2], ((uint8_t*)&CPUreg.SP) + 1, 0xFFFF, 0, CPUreg.PC + 2);
+
+    CPUreg.PC += 3;
     cyclesAccumulated += 12;
 }
 
 //Green SP instructions
 
-void op_0x08(){ //write SP to address in memory 20T 3PC
-    uint16_t addr = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1];
-    LDVal8(CPUreg.SP & 0xFF, memoryMap[addr]);
-    LDVal8((CPUreg.SP >> 8) & 0xFF, memoryMap[addr + 1]);
-    CPUreg.PC += 3; 
-    cyclesAccumulated += 20;
+void pushReg(uint8_t high, uint8_t low) {
+    *memoryMap[--CPUreg.SP] = high;
+    *memoryMap[--CPUreg.SP] = low;
+    CPUreg.PC += 1;
+    cyclesAccumulated += 16;
     logStackTop();
 }
 
-void op_0xC1(){ //pop value from stack into BC 12T 3PC
-    CPUreg.bc.C = *memoryMap[CPUreg.SP]; //read low byte from stack
-    CPUreg.bc.B = *memoryMap[CPUreg.SP + 1]; //read high byte from stack
-    CPUreg.SP += 2; //increment stack pointer by 2
-    CPUreg.PC += 1;     
-    cyclesAccumulated += 12;
-    logStackTop(); //log stack top after pop
-}
-
-void op_0xD1(){ //pop value from stack into DE 12T 3PC
-    CPUreg.de.E = *memoryMap[CPUreg.SP]; //read low byte from stack
-    CPUreg.de.D = *memoryMap[CPUreg.SP + 1]; //read high byte from stack
-    CPUreg.SP += 2; //increment stack pointer by 2
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 12;
-    logStackTop(); //log stack top after pop
-}
-
-void op_0xE1(){ //pop value from stack into HL 12T 3PC
-    CPUreg.hl.L = *memoryMap[CPUreg.SP]; //read low byte from stack
-    CPUreg.hl.H = *memoryMap[CPUreg.SP + 1]; //read high byte from stack
-    CPUreg.SP += 2; //increment stack pointer by 2
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 12;
-    logStackTop(); //log stack top after pop
-}
-
-void op_0xF1(){ //pop value from stack into AF 12T 3PC lower 4 bits of F are not used so 0
-    CPUreg.af.F = *memoryMap[CPUreg.SP] & 0xF0; //read low byte from stack and keep only upper 4 bits
-    CPUreg.af.A = *memoryMap[CPUreg.SP + 1]; //read high byte from stack
-    CPUreg.SP += 2; //increment stack pointer by 2
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 12;
-    logStackTop(); //log stack top after pop
-}
-
-void op_0xC5(){ //push BC onto stack 16T 3PC
-    *memoryMap[--CPUreg.SP] = CPUreg.bc.B; //decrement stack pointer then write high byte to stack
-    *memoryMap[--CPUreg.SP] = CPUreg.bc.C; //decrement stack pointer then write low byte to stack
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 16;
-    logStackTop(); //log stack top after push
-}
-
-void op_0xD5(){ //push DE onto stack 16T 3PC
-    *memoryMap[--CPUreg.SP] = CPUreg.de.D; //decrement stack pointer then write high byte to stack
-    *memoryMap[--CPUreg.SP] = CPUreg.de.E; //decrement stack pointer then write low byte to stack
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 16;
-    logStackTop(); //log stack top after push
-}
-
-void op_0xE5(){ //push HL onto stack 16T 3PC
-    *memoryMap[--CPUreg.SP] = CPUreg.hl.H; //decrement stack pointer then write high byte to stack
-    *memoryMap[--CPUreg.SP] = CPUreg.hl.L; //decrement stack pointer then write low byte to stack
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 16;
-    logStackTop(); //log stack top after push
-}
-
-void op_0xF5(){ //push AF onto stack 16T 3PC lower 4 bits of F are not used so 0
-    *memoryMap[--CPUreg.SP] = CPUreg.af.A; //decrement stack pointer then write high byte to stack
-    *memoryMap[--CPUreg.SP] = CPUreg.af.F & 0xF0; //decrement stack pointer then write low byte to stack (upper 4 bits only)
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 16;
-    logStackTop(); //log stack top after push
-}
+void op_0xC5() { pushReg(CPUreg.bc.B, CPUreg.bc.C); }
+void op_0xD5() { pushReg(CPUreg.de.D, CPUreg.de.E); }
+void op_0xE5() { pushReg(CPUreg.hl.H, CPUreg.hl.L); }
+void op_0xF5() { pushReg(CPUreg.af.A, CPUreg.af.F & 0xF0); }
 
 void op_0xF8() { // LD HL, SP + r8
     int8_t offset = (int8_t)*memoryMap[CPUreg.PC + 1]; //convert to signed 8 bit then cast signed 16 bit so it sign extends correctly e.g. 1000 0000 become 1111 1111 1000 000 (cast to int8_t first) instead of 0000 0000 1000 0000 (cast straight to int16_t)
@@ -756,668 +1103,234 @@ void op_0xF9(){ //load HL into SP 8T 1PC
     logStackTop(); //log stack top after operation
 }
 
+
+void popReg(uint8_t *high, uint8_t *low, int isAF) {
+    *low = *memoryMap[CPUreg.SP];
+    *high = *memoryMap[CPUreg.SP + 1];
+    if (isAF) *low &= 0xF0;
+    CPUreg.SP += 2;
+    CPUreg.PC += 1;
+    cyclesAccumulated += 12;
+    logStackTop();
+}
+
+void op_0xC1() { popReg(&CPUreg.bc.B, &CPUreg.bc.C, 0); }
+void op_0xD1() { popReg(&CPUreg.de.D, &CPUreg.de.E, 0); }
+void op_0xE1() { popReg(&CPUreg.hl.H, &CPUreg.hl.L, 0); }
+void op_0xF1() { popReg(&CPUreg.af.A, &CPUreg.af.F, 1); }
+
+void op_0x08() {
+    uint16_t addr = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1];
+    LDVal8(CPUreg.SP & 0xFF, memoryMap[addr],addr, 1,0xFFFF);
+    LDVal8((CPUreg.SP >> 8) & 0xFF, memoryMap[addr + 1],addr, 1,0xFFFF);
+    CPUreg.PC += 3;
+    cyclesAccumulated += 20;
+    logStackTop();
+}
+
 //Blue LD instructions (8 bit register into memory address in 16 bit register) without register increment
-void op_0x70(){ //load value from register B to address at HL 8T 1PC
-    LDVal8(CPUreg.bc.B, memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
+void storeToAddr(uint16_t addr, uint8_t value) {
+    LDVal8(value, memoryMap[addr],addr, 1,0xFFFF);
+    CPUreg.PC += 1;
     cyclesAccumulated += 8;
 }
 
-void op_0x71(){ //load value from register C to address at HL 8T 1PC
-    LDVal8(CPUreg.bc.C, memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-} 
+void op_0x70() { storeToAddr(CPUreg.hl.HL, CPUreg.bc.B); }
+void op_0x71() { storeToAddr(CPUreg.hl.HL, CPUreg.bc.C); }
+void op_0x72() { storeToAddr(CPUreg.hl.HL, CPUreg.de.D); }
+void op_0x73() { storeToAddr(CPUreg.hl.HL, CPUreg.de.E); }
+void op_0x74() { storeToAddr(CPUreg.hl.HL, CPUreg.hl.H); }
+void op_0x75() { storeToAddr(CPUreg.hl.HL, CPUreg.hl.L); }
+void op_0x77() { storeToAddr(CPUreg.hl.HL, CPUreg.af.A); }
 
-void op_0x72(){ //load value from register D to address at HL 8T 1PC
-    LDVal8(CPUreg.de.D, memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x02() { storeToAddr(CPUreg.bc.BC, CPUreg.af.A); }
+void op_0x12() { storeToAddr(CPUreg.de.DE, CPUreg.af.A); }
 
-void op_0x73(){ //load value from register E to address at HL 8T 1PC
-    LDVal8(CPUreg.de.E, memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x74(){ //load value from register H to address at HL 8T 1PC
-    LDVal8(CPUreg.hl.H, memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x75(){ //load value from register L to address at HL 8T 1PC
-    LDVal8(CPUreg.hl.L, memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x77(){ //load value from register A to address at HL 8T 1PC
-    LDVal8(CPUreg.af.A, memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x02(){ //write register A to address BC 8T 1PC
-    LDVal8(CPUreg.af.A, memoryMap[CPUreg.bc.BC]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x12(){ //write register A to address DE 8T 1PC
-    LDVal8(CPUreg.af.A, memoryMap[CPUreg.de.DE]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
 
 //Blue LD instructions (memory address in 16 bit register into 8 bit register) without register increment
-void op_0x46(){ //load value from address HL into register B 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.bc.B); //load value from address HL into register B
-    CPUreg.PC += 1; 
+void loadFromAddr(uint16_t addr, uint8_t *dest) {
+    LDVal8(*memoryMap[addr], dest,0xFFFF, 0,addr);
+    CPUreg.PC += 1;
     cyclesAccumulated += 8;
 }
 
-void op_0x56(){ //load value from address HL into register D 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.de.D); //load value from address HL into register D
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x46() { loadFromAddr(CPUreg.hl.HL, &CPUreg.bc.B); }
+void op_0x4E() { loadFromAddr(CPUreg.hl.HL, &CPUreg.bc.C); }
+void op_0x56() { loadFromAddr(CPUreg.hl.HL, &CPUreg.de.D); }
+void op_0x5E() { loadFromAddr(CPUreg.hl.HL, &CPUreg.de.E); }
+void op_0x66() { loadFromAddr(CPUreg.hl.HL, &CPUreg.hl.H); }
+void op_0x6E() { loadFromAddr(CPUreg.hl.HL, &CPUreg.hl.L); }
+void op_0x7E() { loadFromAddr(CPUreg.hl.HL, &CPUreg.af.A); }
 
-void op_0x66(){ //load value from address HL into register H 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.hl.H); //load value from address HL into register H
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x4E(){ //load value from address HL into register C 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.bc.C); //load value from address HL into register C
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x5E(){ //load value from address HL into register E 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.de.E); //load value from address HL into register E
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x6E(){ //load value from address HL into register L 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.hl.L); //load value from address HL into register L
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x7E(){ //load value from address HL into register A 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.af.A); //load value from address HL into register A
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x0A(){ //load value from address BC into register A 8T 1PC
-    LDVal8(*memoryMap[CPUreg.bc.BC], &CPUreg.af.A); //load value from address BC into register A
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x1A(){ //load value from address DE into register A 8T 1PC
-    LDVal8(*memoryMap[CPUreg.de.DE], &CPUreg.af.A); //load value from address DE into register A
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x0A() { loadFromAddr(CPUreg.bc.BC, &CPUreg.af.A); }
+void op_0x1A() { loadFromAddr(CPUreg.de.DE, &CPUreg.af.A); }
 
 //Blue LD instructions (8 bit register into HL register with increment or decrement)
 
-void op_0x22(){ //write register A to address HL and increment HL 8T 1PC
-    LDVal8(CPUreg.af.A, memoryMap[CPUreg.hl.HL]);
-    CPUreg.hl.HL += 1; //increment HL by 1
-    CPUreg.PC += 1; 
+void storeAtoHLAndStep(int step) {
+    LDVal8(CPUreg.af.A, memoryMap[CPUreg.hl.HL],CPUreg.hl.HL,1,0xFFFF);
+    CPUreg.hl.HL += step;
+    CPUreg.PC += 1;
     cyclesAccumulated += 8;
 }
 
-void op_0x32(){ //write register A to address HL and decrement HL 8T 1PC
-    LDVal8(CPUreg.af.A, memoryMap[CPUreg.hl.HL]);
-    CPUreg.hl.HL -= 1; //decrement HL by 1
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x22() { storeAtoHLAndStep(1); }
+void op_0x32() { storeAtoHLAndStep(-1); }
 
 //Blue LD instructions (8 bit value into 8/16 bit register)
-void op_0x06(){ //load immediate value into register B 8T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.bc.B); //load immediate value into register B
-    CPUreg.PC += 2; 
+void loadImmToReg(uint8_t *reg) {
+    LDVal8(*memoryMap[CPUreg.PC + 1], reg,CPUreg.PC + 1,0,0xFFFF);
+    CPUreg.PC += 2;
     cyclesAccumulated += 8;
 }
 
-void op_0x16(){ //load immediate value into register D 8T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.de.D); //load immediate value into register D
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
+void op_0x06() { loadImmToReg(&CPUreg.bc.B); }
+void op_0x0E() { loadImmToReg(&CPUreg.bc.C); }
+void op_0x16() { loadImmToReg(&CPUreg.de.D); }
+void op_0x1E() { loadImmToReg(&CPUreg.de.E); }
+void op_0x26() { loadImmToReg(&CPUreg.hl.H); }
+void op_0x2E() { loadImmToReg(&CPUreg.hl.L); }
+void op_0x3E() { loadImmToReg(&CPUreg.af.A); }
 
-void op_0x26(){ //load immediate value into register H 8T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.hl.H); //load immediate value into register H
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x0E(){ //load immediate value into register C 8T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.bc.C); //load immediate value into register C
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x1E(){ //load immediate value into register E 8T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.de.E); //load immediate value into register E
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x2E(){ //load immediate value into register L 8T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.hl.L); //load immediate value into register L
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x3E(){ //load immediate value into register A 8T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], &CPUreg.af.A); //load immediate value into register A
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x36(){ //load immediate value into address HL 12T 2PC
-    LDVal8(*memoryMap[CPUreg.PC + 1], memoryMap[CPUreg.hl.HL]); //load immediate value into address HL
-    CPUreg.PC += 2; 
+void op_0x36(){
+    LDVal8(*memoryMap[CPUreg.PC + 1], memoryMap[CPUreg.hl.HL],CPUreg.hl.HL,1,CPUreg.PC + 1);
+    CPUreg.PC += 2;
     cyclesAccumulated += 12;
-}
+} 
 
 //Blue LD instructions (HL register address increment or decrement into 8 bit register)
-void op_0x2A(){ //load value from address HL into register A and increment HL 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.af.A); //load value from address HL into register A
-    CPUreg.hl.HL += 1; //increment HL by 1
-    CPUreg.PC += 1; 
+void loadAFromHLAndStep(int step) {
+    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.af.A,0xFFFF,1,CPUreg.hl.HL);
+    CPUreg.hl.HL += step;
+    CPUreg.PC += 1;
     cyclesAccumulated += 8;
 }
 
-void op_0x3A(){ //load value from address HL into register A and decrement HL 8T 1PC
-    LDVal8(*memoryMap[CPUreg.hl.HL], &CPUreg.af.A); //load value from address HL into register A
-    CPUreg.hl.HL -= 1; //decrement HL by 1
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x2A() { loadAFromHLAndStep(1); }
+void op_0x3A() { loadAFromHLAndStep(-1); }
 
 //Blue LD instructions (8 bit register into 8 bit register)
 
-void op_0x40(){ //load value from register B to register B 4T 1PC
-    LDVal8(CPUreg.bc.B, &CPUreg.bc.B);
-    CPUreg.PC += 1; 
+void loadRegToReg(uint8_t src, uint8_t *dest) {
+    LDVal8(src, dest,0xFFFF,0,0xFFFF);
+    CPUreg.PC += 1;
     cyclesAccumulated += 4;
 }
 
-void op_0x50(){ //load value from register B to register D 4T 1PC
-    LDVal8(CPUreg.bc.B, &CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
+void op_0x40() { loadRegToReg(CPUreg.bc.B, &CPUreg.bc.B); }
+void op_0x41() { loadRegToReg(CPUreg.bc.C, &CPUreg.bc.B); }
+void op_0x42() { loadRegToReg(CPUreg.de.D, &CPUreg.bc.B); }
+void op_0x43() { loadRegToReg(CPUreg.de.E, &CPUreg.bc.B); }
+void op_0x44() { loadRegToReg(CPUreg.hl.H, &CPUreg.bc.B); }
+void op_0x45() { loadRegToReg(CPUreg.hl.L, &CPUreg.bc.B); }
+void op_0x47() { loadRegToReg(CPUreg.af.A, &CPUreg.bc.B); }
 
-void op_0x60(){ //load value from register B to register H 4T 1PC
-    LDVal8(CPUreg.bc.B, &CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
+void op_0x48() { loadRegToReg(CPUreg.bc.B, &CPUreg.bc.C); }
+void op_0x49() { loadRegToReg(CPUreg.bc.C, &CPUreg.bc.C); }
+void op_0x4A() { loadRegToReg(CPUreg.de.D, &CPUreg.bc.C); }
+void op_0x4B() { loadRegToReg(CPUreg.de.E, &CPUreg.bc.C); }
+void op_0x4C() { loadRegToReg(CPUreg.hl.H, &CPUreg.bc.C); }
+void op_0x4D() { loadRegToReg(CPUreg.hl.L, &CPUreg.bc.C); }
+void op_0x4F() { loadRegToReg(CPUreg.af.A, &CPUreg.bc.C); }
 
-void op_0x41(){ //load value from register C to register B 4T 1PC
-    LDVal8(CPUreg.bc.C, &CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
+void op_0x50() { loadRegToReg(CPUreg.bc.B, &CPUreg.de.D); }
+void op_0x51() { loadRegToReg(CPUreg.bc.C, &CPUreg.de.D); }
+void op_0x52() { loadRegToReg(CPUreg.de.D, &CPUreg.de.D); }
+void op_0x53() { loadRegToReg(CPUreg.de.E, &CPUreg.de.D); }
+void op_0x54() { loadRegToReg(CPUreg.hl.H, &CPUreg.de.D); }
+void op_0x55() { loadRegToReg(CPUreg.hl.L, &CPUreg.de.D); }
+void op_0x57() { loadRegToReg(CPUreg.af.A, &CPUreg.de.D); }
 
-void op_0x51(){ //load value from register C to register D 4T 1PC
-    LDVal8(CPUreg.bc.C, &CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
+void op_0x58() { loadRegToReg(CPUreg.bc.B, &CPUreg.de.E); }
+void op_0x59() { loadRegToReg(CPUreg.bc.C, &CPUreg.de.E); }
+void op_0x5A() { loadRegToReg(CPUreg.de.D, &CPUreg.de.E); }
+void op_0x5B() { loadRegToReg(CPUreg.de.E, &CPUreg.de.E); }
+void op_0x5C() { loadRegToReg(CPUreg.hl.H, &CPUreg.de.E); }
+void op_0x5D() { loadRegToReg(CPUreg.hl.L, &CPUreg.de.E); }
+void op_0x5F() { loadRegToReg(CPUreg.af.A, &CPUreg.de.E); }
 
-void op_0x61(){ //load value from register C to register H 4T 1PC
-    LDVal8(CPUreg.bc.C, &CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
+void op_0x60() { loadRegToReg(CPUreg.bc.B, &CPUreg.hl.H); }
+void op_0x61() { loadRegToReg(CPUreg.bc.C, &CPUreg.hl.H); }
+void op_0x62() { loadRegToReg(CPUreg.de.D, &CPUreg.hl.H); }
+void op_0x63() { loadRegToReg(CPUreg.de.E, &CPUreg.hl.H); }
+void op_0x64() { loadRegToReg(CPUreg.hl.H, &CPUreg.hl.H); }
+void op_0x65() { loadRegToReg(CPUreg.hl.L, &CPUreg.hl.H); }
+void op_0x67() { loadRegToReg(CPUreg.af.A, &CPUreg.hl.H); }
 
-void op_0x42(){ //load value from register D to register B 4T 1PC
-    LDVal8(CPUreg.de.D, &CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
+void op_0x68() { loadRegToReg(CPUreg.bc.B, &CPUreg.hl.L); }
+void op_0x69() { loadRegToReg(CPUreg.bc.C, &CPUreg.hl.L); }
+void op_0x6A() { loadRegToReg(CPUreg.de.D, &CPUreg.hl.L); }
+void op_0x6B() { loadRegToReg(CPUreg.de.E, &CPUreg.hl.L); }
+void op_0x6C() { loadRegToReg(CPUreg.hl.H, &CPUreg.hl.L); }
+void op_0x6D() { loadRegToReg(CPUreg.hl.L, &CPUreg.hl.L); }
+void op_0x6F() { loadRegToReg(CPUreg.af.A, &CPUreg.hl.L); }
 
-void op_0x52(){ //load value from register D to register D 4T 1PC
-    LDVal8(CPUreg.de.D, &CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x62(){ //load value from register D to register H 4T 1PC
-    LDVal8(CPUreg.de.D, &CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x43(){ //load value from register E to register B 4T 1PC
-    LDVal8(CPUreg.de.E, &CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x53(){ //load value from register E to register D 4T 1PC
-    LDVal8(CPUreg.de.E, &CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x63(){ //load value from register E to register H 4T 1PC
-    LDVal8(CPUreg.de.E, &CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x44(){ //load value from register H to register B 4T 1PC
-    LDVal8(CPUreg.hl.H, &CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x54(){ //load value from register H to register D 4T 1PC
-    LDVal8(CPUreg.hl.H, &CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x64(){ //load value from register H to register H 4T 1PC
-    LDVal8(CPUreg.hl.H, &CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x45(){ //load value from register L to register B 4T 1PC
-    LDVal8(CPUreg.hl.L, &CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x55(){ //load value from register L to register D 4T 1PC
-    LDVal8(CPUreg.hl.L, &CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x65(){ //load value from register L to register H 4T 1PC
-    LDVal8(CPUreg.hl.L, &CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x47(){ //load value from register A to register B 4T 1PC
-    LDVal8(CPUreg.af.A, &CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x57(){ //load value from register A to register D 4T 1PC
-    LDVal8(CPUreg.af.A, &CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x67(){ //load value from register A to register H 4T 1PC
-    LDVal8(CPUreg.af.A, &CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x48(){ //load value from register B to register C 4T 1PC
-    LDVal8(CPUreg.bc.B, &CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x58(){ //load value from register B to register E 4T 1PC
-    LDVal8(CPUreg.bc.B, &CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x68(){ //load value from register B to register L 4T 1PC
-    LDVal8(CPUreg.bc.B, &CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x78(){ //load value from register B to register A 4T 1PC
-    LDVal8(CPUreg.bc.B, &CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x49(){ //load value from register C to register C 4T 1PC
-    LDVal8(CPUreg.bc.C, &CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x59(){ //load value from register C to register E 4T 1PC
-    LDVal8(CPUreg.bc.C, &CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x69(){ //load value from register C to register L 4T 1PC
-    LDVal8(CPUreg.bc.C, &CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x79(){ //load value from register C to register A 4T 1PC
-    LDVal8(CPUreg.bc.C, &CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x4A(){ //load value from register D to register C 4T 1PC
-    LDVal8(CPUreg.de.D, &CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x5A(){ //load value from register D to register E 4T 1PC
-    LDVal8(CPUreg.de.D, &CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x6A(){ //load value from register D to register L 4T 1PC
-    LDVal8(CPUreg.de.D, &CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x7A(){ //load value from register D to register A 4T 1PC
-    LDVal8(CPUreg.de.D, &CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x4B(){ //load value from register E to register C 4T 1PC
-    LDVal8(CPUreg.de.E, &CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x5B(){ //load value from register E to register E 4T 1PC
-    LDVal8(CPUreg.de.E, &CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x6B(){ //load value from register E to register L 4T 1PC
-    LDVal8(CPUreg.de.E, &CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x7B(){ //load value from register E to register A 4T 1PC
-    LDVal8(CPUreg.de.E, &CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x4C(){ //load value from register H to register C 4T 1PC
-    LDVal8(CPUreg.hl.H, &CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x5C(){ //load value from register H to register E 4T 1PC
-    LDVal8(CPUreg.hl.H, &CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x6C(){ //load value from register H to register L 4T 1PC
-    LDVal8(CPUreg.hl.H, &CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x7C(){ //load value from register H to register A 4T 1PC
-    LDVal8(CPUreg.hl.H, &CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x4D(){ //load value from register L to register C 4T 1PC
-    LDVal8(CPUreg.hl.L, &CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x5D(){ //load value from register L to register E 4T 1PC
-    LDVal8(CPUreg.hl.L, &CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x6D(){ //load value from register L to register L 4T 1PC
-    LDVal8(CPUreg.hl.L, &CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}   
-
-void op_0x7D(){ //load value from register L to register A 4T 1PC
-    LDVal8(CPUreg.hl.L, &CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x4F(){ //load value from register A to register C 4T 1PC
-    LDVal8(CPUreg.af.A, &CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x5F(){ //load value from register A to register E 4T 1PC
-    LDVal8(CPUreg.af.A, &CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}   
-
-void op_0x6F(){ //load value from register A to register L 4T 1PC
-    LDVal8(CPUreg.af.A, &CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x7F(){ //load value from register A to register A 4T 1PC
-    LDVal8(CPUreg.af.A, &CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
+void op_0x78() { loadRegToReg(CPUreg.bc.B, &CPUreg.af.A); }
+void op_0x79() { loadRegToReg(CPUreg.bc.C, &CPUreg.af.A); }
+void op_0x7A() { loadRegToReg(CPUreg.de.D, &CPUreg.af.A); }
+void op_0x7B() { loadRegToReg(CPUreg.de.E, &CPUreg.af.A); }
+void op_0x7C() { loadRegToReg(CPUreg.hl.H, &CPUreg.af.A); }
+void op_0x7D() { loadRegToReg(CPUreg.hl.L, &CPUreg.af.A); }
+void op_0x7F() { loadRegToReg(CPUreg.af.A, &CPUreg.af.A); }
 
 //Blue load A C and a8 A - 0xFF00-0xFFFF instructions
 
 void op_0xE0(){ //load A into address 0xFF00 + immediate 12T 2PC
     uint8_t immediate = *memoryMap[CPUreg.PC + 1]; //get immediate value from memory
-    LDVal8(CPUreg.af.A, memoryMap[0xFF00 + immediate]); //load value from A into address 0xFF00 + immediate
+    LDVal8(CPUreg.af.A, memoryMap[0xFF00 + immediate],0xFF00+immediate,1,0xFFFF); //load value from A into address 0xFF00 + immediate
     CPUreg.PC += 2; 
     cyclesAccumulated += 12;
 }
 
-uint8_t buttonState = 0xFF; // All buttons released (bits 0–7 high)
-
-void updateJoypadRegister() {
-    uint8_t select = *memoryMap[0xFF00] & 0xF0;
-    uint8_t result = 0xCF | select;
-    uint8_t lower = 0x0F;
-
-    if (!(select & (1 << 4))) {
-        lower &= (buttonState & 0x0F); // D-pad
-    }
-
-    if (!(select & (1 << 5))) {
-        lower &= ((buttonState >> 4) & 0x0F); // Action buttons
-    }
-
-    result = (result & 0xF0) | lower;
-    *memoryMap[0xFF00] = result;
-}
-
-void handleButtonPress(SDL_Event *event) {
-    int pressed = (event->type == SDL_KEYDOWN) ? 0 : 1;
-    uint8_t prevState = buttonState;
-
-    switch (event->key.keysym.sym) {
-        // D-pad (P14 group)
-        case SDLK_w: if (pressed) buttonState |= (1 << 2); else buttonState &= ~(1 << 2); break; // Up
-        case SDLK_s: if (pressed) buttonState |= (1 << 3); else buttonState &= ~(1 << 3); break; // Down
-        case SDLK_a: if (pressed) buttonState |= (1 << 1); else buttonState &= ~(1 << 1); break; // Left
-        case SDLK_d: if (pressed) buttonState |= (1 << 0); else buttonState &= ~(1 << 0); break; // Right
-
-        // Action buttons (P15 group)
-        case SDLK_v: if (pressed) buttonState |= (1 << 4); else buttonState &= ~(1 << 4); break; // A
-        case SDLK_c: if (pressed) buttonState |= (1 << 5); else buttonState &= ~(1 << 5); break; // B
-        case SDLK_r: if (pressed) buttonState |= (1 << 6); else buttonState &= ~(1 << 6); break; // Select
-        case SDLK_f: if (pressed) buttonState |= (1 << 7); else buttonState &= ~(1 << 7); break; // Start
-    }
-
-    // --- Update FF00 to reflect current button states ---
-    uint8_t select = *memoryMap[0xFF00] & 0xF0; // Get selection bits (P14/P15)
-    uint8_t result = 0xCF | select;
-
-    uint8_t lower = 0x0F;
-
-    if (!(select & (1 << 4))) { // P14 low → D-pad selected
-        lower &= (buttonState & 0x0F);
-    }
-
-    if (!(select & (1 << 5))) { // P15 low → Action buttons selected
-        lower &= ((buttonState >> 4) & 0x0F);
-    }
-
-    result = (result & 0xF0) | lower;
-    *memoryMap[0xFF00] = result;
-
-    // Trigger joypad interrupt if any new button press occurred
-    if ((prevState & ~buttonState) & 0xFF) {
-        *memoryMap[0xFF0F] |= 0x10; // Bit 4 = Joypad interrupt
-    }
-}
-
-uint8_t readJoypad(uint8_t select) {
-    // select: current value at 0xFF00 (written by CPU)
-    uint8_t result = 0xCF; // Upper bits default to 1, bits 4 & 5 control selection
-    result |= (select & 0x30); // preserve select bits
-
-    if (!(select & (1 << 4))) {
-        // P14 low: D-pad selected
-        result &= (0xF0 | (buttonState & 0x0F));
-    } else if (!(select & (1 << 5))) {
-        // P15 low: Action buttons selected
-        result &= (0xF0 | ((buttonState >> 4) & 0x0F));
-    }
-
-    return result;
-}
 
 void op_0xF0() { // LD A, (FF00 + n)
     uint8_t immediate = *memoryMap[CPUreg.PC + 1];
     uint16_t addr = 0xFF00 + immediate;
 
-    uint8_t value;
-    if (addr == 0xFF00) {
-       // value = readJoypad(*memoryMap[0xFF00]);
-        //printf("Read Joypad: %02X, FF00: %02X\n", value, *memoryMap[0xFF00]); // Debugging output
-        value = *memoryMap[addr];
-    } else {
-        value = *memoryMap[addr];
-    }
-
-    LDVal8(value, &CPUreg.af.A);
+    LDVal8(*memoryMap[addr], &CPUreg.af.A,0xFFFF,1,addr);
 
     CPUreg.PC += 2;
     cyclesAccumulated += 12;
 }
 
-void op_0xE2(){ //load value from register A into address C for 0xFF00-0xFFFF  8T 1PC
-    LDVal8(CPUreg.af.A, memoryMap[CPUreg.bc.C + 0xFF00]); 
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0xF2(){ //load value from address 0xFF00-0xFFFF into register A 8T 1PC
-    LDVal8(*memoryMap[CPUreg.bc.C + 0xFF00], &CPUreg.af.A); 
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0xE2() { storeToAddr(0xFF00 + CPUreg.bc.C, CPUreg.af.A); }
+void op_0xF2() { loadFromAddr(0xFF00 + CPUreg.bc.C, &CPUreg.af.A); }
 
 //Blue LD instructions A and 16 bit immediate address
 
 void op_0xEA(){ // load A into address a16 16T 3PC
     uint16_t address = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1];
-    LDVal8(CPUreg.af.A, memoryMap[address]);
+    LDVal8(CPUreg.af.A, memoryMap[address],address,1,0xFFFF);
     CPUreg.PC += 3; 
     cyclesAccumulated += 16;
 }
 
 void op_0xFA(){ // load value from address a16 into A 16T 3PC
     uint16_t address = (*memoryMap[CPUreg.PC + 2] << 8 | *memoryMap[CPUreg.PC + 1]); //combine low and high byte to get address
-    LDVal8(*memoryMap[address], &CPUreg.af.A);
+    LDVal8(*memoryMap[address], &CPUreg.af.A,0xFFFF,1,address);
     CPUreg.PC += 3; 
     cyclesAccumulated += 16;
 }
 
 //Red ADD instructions (add 16 bit register to HL) with flags
-void op_0x09(){ //add BC to HL 8T 1PC
-    uint16_t result = CPUreg.hl.HL + CPUreg.bc.BC;
-    setSubtractFlag(0); // clear subtract flag
-    setCarryFlag(result < CPUreg.hl.HL); // set carry flag if result is less than HL
-    setHalfCarryFlag((CPUreg.hl.HL & 0xFFF) + (CPUreg.bc.BC & 0xFFF) > 0xFFF); // set half carry flag if low nibble overflows
-    CPUreg.hl.HL = result; // update HL with result
-    CPUreg.PC += 1; 
+void add16ToHL(uint16_t value) {
+    uint16_t result = CPUreg.hl.HL + value;
+    setSubtractFlag(0);
+    setCarryFlag(result < CPUreg.hl.HL);
+    setHalfCarryFlag((CPUreg.hl.HL & 0xFFF) + (value & 0xFFF) > 0xFFF);
+    CPUreg.hl.HL = result;
+    CPUreg.PC += 1;
     cyclesAccumulated += 8;
 }
 
-void op_0x19(){ //add DE to HL 8T 1PC
-    uint16_t result = CPUreg.hl.HL + CPUreg.de.DE;
-    setSubtractFlag(0); // clear subtract flag
-    setCarryFlag(result < CPUreg.hl.HL); // set carry flag if result is less than HL
-    setHalfCarryFlag((CPUreg.hl.HL & 0xFFF) + (CPUreg.de.DE & 0xFFF) > 0xFFF); // set half carry flag if low nibble overflows
-    CPUreg.hl.HL = result; // update HL with result
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x29(){ //add HL to HL 8T 1PC
-    uint16_t result = CPUreg.hl.HL + CPUreg.hl.HL;
-    setSubtractFlag(0); // clear subtract flag
-    setCarryFlag(result < CPUreg.hl.HL); // set carry flag if result is less than HL
-    setHalfCarryFlag((CPUreg.hl.HL & 0xFFF) + (CPUreg.hl.HL & 0xFFF) > 0xFFF); // set half carry flag if low nibble overflows
-    CPUreg.hl.HL = result; // update HL with result
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x39(){ //add SP to HL 8T 1PC
-    uint16_t result = CPUreg.hl.HL + CPUreg.SP;
-    setSubtractFlag(0); // clear subtract flag
-    setCarryFlag(result < CPUreg.hl.HL); // set carry flag if result is less than HL
-    setHalfCarryFlag((CPUreg.hl.HL & 0xFFF) + (CPUreg.SP & 0xFFF) > 0xFFF); // set half carry flag if low nibble overflows
-    CPUreg.hl.HL = result; // update HL with result
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x09() { add16ToHL(CPUreg.bc.BC); }
+void op_0x19() { add16ToHL(CPUreg.de.DE); }
+void op_0x29() { add16ToHL(CPUreg.hl.HL); }
+void op_0x39() { add16ToHL(CPUreg.SP); }
 
 void op_0xE8() {
-    int8_t offset = (int8_t)*memoryMap[CPUreg.PC + 1]; // signed immediate
-    int16_t signedOffset = (int16_t)offset; // sign extend
+    int8_t offset = (int8_t)*memoryMap[CPUreg.PC + 1];
+    int16_t signedOffset = (int16_t)offset;
     uint16_t result = CPUreg.SP + signedOffset;
 
     setZeroFlag(0);
@@ -1426,275 +1339,90 @@ void op_0xE8() {
     setCarryFlag(((CPUreg.SP & 0xFF) + (offset & 0xFF)) > 0xFF);
 
     CPUreg.SP = result;
-
     CPUreg.PC += 2;
     cyclesAccumulated += 16;
 }
 
 //Red Increment instructions (increment 16 bit register by 1) with no flag
-
-void op_0x03(){ //increment BC 8T 1PC
-    CPUreg.bc.BC += 1;
-    CPUreg.PC += 1; 
+void inc16(uint16_t* reg) {
+    (*reg)++;
+    CPUreg.PC += 1;
     cyclesAccumulated += 8;
 }
 
-void op_0x13(){ //increment DE 8T 1PC
-    CPUreg.de.DE += 1;
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x23(){ //increment HL 8T 1PC
-    CPUreg.hl.HL += 1;
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x33(){ //increment SP 8T 1PC
-    CPUreg.SP += 1;
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x03() { inc16(&CPUreg.bc.BC); }
+void op_0x13() { inc16(&CPUreg.de.DE); }
+void op_0x23() { inc16(&CPUreg.hl.HL); }
+void op_0x33() { inc16(&CPUreg.SP); }
 
 //Red Decrement instructions (decrement 16 bit register by 1) with no flag
-void op_0x0B(){ //decrement BC 8T 1PC
-    CPUreg.bc.BC -= 1;
-    CPUreg.PC += 1; 
+void dec16(uint16_t* reg) {
+    (*reg)--;
+    CPUreg.PC += 1;
     cyclesAccumulated += 8;
 }
 
-void op_0x1B(){ //decrement DE 8T 1PC
-    CPUreg.de.DE -= 1;
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x2B(){ //decrement HL 8T 1PC
-    CPUreg.hl.HL -= 1;
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x3B(){ //decrement SP 8T 1PC
-    CPUreg.SP -= 1;
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
+void op_0x0B() { dec16(&CPUreg.bc.BC); }
+void op_0x1B() { dec16(&CPUreg.de.DE); }
+void op_0x2B() { dec16(&CPUreg.hl.HL); }
+void op_0x3B() { dec16(&CPUreg.SP); }
 
 //Yellow Increment instructions (increment 8 bit register by 1) with flags
 
-void op_0x04(){ //increment B 4T 1PC
-    setHalfCarryFlag((CPUreg.bc.B & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    CPUreg.bc.B += 1;
-    if (CPUreg.bc.B == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
+void inc8(uint8_t* reg) {
+    setHalfCarryFlag((*reg & 0x0F) == 0x0F);
+    (*reg)++;
+    setZeroFlag(*reg == 0);
+    setSubtractFlag(0);
+    CPUreg.PC += 1;
     cyclesAccumulated += 4;
 }
 
-void op_0x14(){ //increment D 4T 1PC
-    setHalfCarryFlag((CPUreg.de.D & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    CPUreg.de.D += 1;
-    if (CPUreg.de.D == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
+void op_0x04() { inc8(&CPUreg.bc.B); }
+void op_0x14() { inc8(&CPUreg.de.D); }
+void op_0x24() { inc8(&CPUreg.hl.H); }
+void op_0x0C() { inc8(&CPUreg.bc.C); }
+void op_0x1C() { inc8(&CPUreg.de.E); }
+void op_0x2C() { inc8(&CPUreg.hl.L); }
+void op_0x3C() { inc8(&CPUreg.af.A); }
 
-void op_0x24(){ //increment H 4T 1PC
-    setHalfCarryFlag((CPUreg.hl.H & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    CPUreg.hl.H += 1;
-    if (CPUreg.hl.H == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x34(){ //increment address at HL 12T 1PC
-    uint8_t value = *memoryMap[CPUreg.hl.HL]; // get value from address HL
-    setHalfCarryFlag((value & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    value += 1; // increment value
-    *memoryMap[CPUreg.hl.HL] = value; // store incremented value back to address HL
-    if (value == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
+void op_0x34() {
+    uint8_t value = *memoryMap[CPUreg.hl.HL];
+    setHalfCarryFlag((value & 0x0F) == 0x0F);
+    value++;
+    *memoryMap[CPUreg.hl.HL] = value;
+    setZeroFlag(value == 0);
+    setSubtractFlag(0);
+    CPUreg.PC += 1;
     cyclesAccumulated += 12;
 }
 
-void op_0x0C(){ //increment C 4T 1PC
-    setHalfCarryFlag((CPUreg.bc.C & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    CPUreg.bc.C += 1;
-    if (CPUreg.bc.C == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
+void dec8(uint8_t* reg) {
+    setHalfCarryFlag((*reg & 0x0F) == 0x00);
+    (*reg)--;
+    setZeroFlag(*reg == 0);
+    setSubtractFlag(1);
+    CPUreg.PC += 1;
     cyclesAccumulated += 4;
 }
 
-void op_0x1C(){ //increment E 4T 1PC
-    setHalfCarryFlag((CPUreg.de.E & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    CPUreg.de.E += 1;
-    if (CPUreg.de.E == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
+void op_0x05() { dec8(&CPUreg.bc.B); }
+void op_0x15() { dec8(&CPUreg.de.D); }
+void op_0x25() { dec8(&CPUreg.hl.H); }
+void op_0x0D() { dec8(&CPUreg.bc.C); }
+void op_0x1D() { dec8(&CPUreg.de.E); }
+void op_0x2D() { dec8(&CPUreg.hl.L); }
+void op_0x3D() { dec8(&CPUreg.af.A); }
 
-void op_0x2C(){ //increment L 4T 1PC
-    setHalfCarryFlag((CPUreg.hl.L & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    CPUreg.hl.L += 1;
-    if (CPUreg.hl.L == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x3C(){ //increment A 4T 1PC
-    setHalfCarryFlag((CPUreg.af.A & 0x0F) == 0x0F); // set half carry flag if low nibble is 1111 before increment
-    CPUreg.af.A += 1;
-    if (CPUreg.af.A == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(0); // clear subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-//Yellow Decrement instructions (decrement 8 bit register by 1) with flags
-void op_0x05(){ //decrement B 4T 1PC
-    setHalfCarryFlag((CPUreg.bc.B & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    CPUreg.bc.B -= 1;
-    if (CPUreg.bc.B == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x15(){ //decrement D 4T 1PC
-    setHalfCarryFlag((CPUreg.de.D & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    CPUreg.de.D -= 1;
-    if (CPUreg.de.D == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x25(){ //decrement H 4T 1PC
-    setHalfCarryFlag((CPUreg.hl.H & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    CPUreg.hl.H -= 1;
-    if (CPUreg.hl.H == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x35(){ //decrement address at HL 12T 1PC
-    setHalfCarryFlag((*memoryMap[CPUreg.hl.HL] & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    uint8_t value = *memoryMap[CPUreg.hl.HL]; // get value from address HL
-    value -= 1; // decrement value
-    *memoryMap[CPUreg.hl.HL] = value; // store decremented value back to address HL
-    if (value == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
+void op_0x35() {
+    uint8_t value = *memoryMap[CPUreg.hl.HL];
+    setHalfCarryFlag((value & 0x0F) == 0x00);
+    value--;
+    *memoryMap[CPUreg.hl.HL] = value;
+    setZeroFlag(value == 0);
+    setSubtractFlag(1);
+    CPUreg.PC += 1;
     cyclesAccumulated += 12;
-}
-
-void op_0x0D(){ //decrement C 4T 1PC
-    setHalfCarryFlag((CPUreg.bc.C & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    CPUreg.bc.C -= 1;
-    if (CPUreg.bc.C == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x1D(){ //decrement E 4T 1PC
-    setHalfCarryFlag((CPUreg.de.E & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    CPUreg.de.E -= 1;
-    if (CPUreg.de.E == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x2D(){ //decrement L 4T 1PC
-    setHalfCarryFlag((CPUreg.hl.L & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    CPUreg.hl.L -= 1;
-    if (CPUreg.hl.L == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
-}
-
-void op_0x3D(){ //decrement A 4T 1PC
-    setHalfCarryFlag((CPUreg.af.A & 0x0F) == 0x00); // set half carry flag if low nibble is 0000 before decrement
-    CPUreg.af.A -= 1;
-    if (CPUreg.af.A == 0) {
-        setZeroFlag(1); // set zero flag
-    } else {
-        setZeroFlag(0); // clear zero flag
-    }
-    setSubtractFlag(1); // set subtract flag
-    CPUreg.PC += 1; //increment PC by 1
-    cyclesAccumulated += 4;
 }
 
 //Yellow Add instructions (add 8 bit register to 8 bit register) with flags
@@ -1721,252 +1449,71 @@ void adcToA(uint8_t value) {
     CPUreg.af.A = result & 0xFF;
 }
 
-void op_0x80(){ //add B to A 4T 1PC
-    addToA(CPUreg.bc.B);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+void op_0x80() { addToA(CPUreg.bc.B); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x81() { addToA(CPUreg.bc.C); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x82() { addToA(CPUreg.de.D); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x83() { addToA(CPUreg.de.E); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x84() { addToA(CPUreg.hl.H); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x85() { addToA(CPUreg.hl.L); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x86() { addToA(*memoryMap[CPUreg.hl.HL]); CPUreg.PC += 1; cyclesAccumulated += 8; }
+void op_0x87() { addToA(CPUreg.af.A); CPUreg.PC += 1; cyclesAccumulated += 4; }
 
-void op_0x81(){ //add C to A 4T 1PC
-    addToA(CPUreg.bc.C);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+void op_0x88() { adcToA(CPUreg.bc.B); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x89() { adcToA(CPUreg.bc.C); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x8A() { adcToA(CPUreg.de.D); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x8B() { adcToA(CPUreg.de.E); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x8C() { adcToA(CPUreg.hl.H); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x8D() { adcToA(CPUreg.hl.L); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x8E() { adcToA(*memoryMap[CPUreg.hl.HL]); CPUreg.PC += 1; cyclesAccumulated += 8; }
+void op_0x8F() { adcToA(CPUreg.af.A); CPUreg.PC += 1; cyclesAccumulated += 4; }
 
-void op_0x82(){ //add D to A 4T 1PC
-    addToA(CPUreg.de.D);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x83(){ //add E to A 4T 1PC
-    addToA(CPUreg.de.E);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x84(){ //add H to A 4T 1PC
-    addToA(CPUreg.hl.H);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x85(){ //add L to A 4T 1PC
-    addToA(CPUreg.hl.L);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x86(){ //add value at address HL to A 8T 1PC
-    addToA(*memoryMap[CPUreg.hl.HL]); //add value at address HL to A
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x87(){ //add A to A 4T 1PC
-    addToA(CPUreg.af.A);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x88(){ // add Carry Flag + B to A 4T 1PC
-    adcToA(CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x89(){ // add Carry Flag + C to A 4T 1PC
-    adcToA(CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x8A(){ // add Carry Flag + D to A 4T 1PC
-    adcToA(CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x8B(){ // add Carry Flag + E to A 4T 1PC
-    adcToA(CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x8C(){ // add Carry Flag + H to A 4T 1PC
-    adcToA(CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x8D(){ // add Carry Flag + L to A 4T 1PC
-    adcToA(CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x8E() { // add Carry Flag + value at address HL to A 8T 1PC
-    adcToA(*memoryMap[CPUreg.hl.HL]); // add value at address HL to A
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x8F(){ // add Carry Flag + A to A 4T 1PC
-    adcToA(CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0xC6(){ // add immediate value to A 8T 2PC
-    uint8_t value = *memoryMap[CPUreg.PC + 1]; // get immediate value from memory
-    addToA(value); // add immediate value to A
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
-
-void op_0xCE(){ // add immediate value + Carry Flag to A 8T 2PC
-    uint8_t value = *memoryMap[CPUreg.PC + 1];
-    adcToA(value);
-    CPUreg.PC += 2;
-    cyclesAccumulated += 8;
-}
+void op_0xC6() { addToA(*memoryMap[CPUreg.PC + 1]); CPUreg.PC += 2; cyclesAccumulated += 8; }
+void op_0xCE() { adcToA(*memoryMap[CPUreg.PC + 1]); CPUreg.PC += 2; cyclesAccumulated += 8; }
 
 //Yellow Subtract instructions (subtract 8 bit register from 8 bit register) with flags
 void subFromA(uint8_t value) {
     uint16_t result = CPUreg.af.A - value;
 
-    setHalfCarryFlag((CPUreg.af.A & 0x0F) < (value & 0x0F)); // half-borrow occurred
-    setCarryFlag(CPUreg.af.A < value); // full borrow occurred
+    setHalfCarryFlag((CPUreg.af.A & 0x0F) < (value & 0x0F));
+    setCarryFlag(CPUreg.af.A < value);
     CPUreg.af.A = result & 0xFF;
 
-    setZeroFlag((CPUreg.af.A & 0xFF) == 0); // result is zero
-    setSubtractFlag(1); // subtract flag set
+    setZeroFlag((CPUreg.af.A & 0xFF) == 0);
+    setSubtractFlag(1);
 }
 
 void sbcFromA(uint8_t value) {
     uint8_t a = CPUreg.af.A;
-    uint8_t carry = getCarryFlag();  // usually 0 or 1
+    uint8_t carry = getCarryFlag();
 
     uint16_t result = a - value - carry;
 
-    setZeroFlag((result & 0xFF) == 0);                        // Z flag: zero result
-    setSubtractFlag(1);                                       // N flag: subtraction
-    setHalfCarryFlag((a & 0x0F) < ((value & 0x0F) + carry)); // H flag: half borrow
-    setCarryFlag(a < (value + carry));                        // C flag: full borrow
+    setZeroFlag((result & 0xFF) == 0);
+    setSubtractFlag(1);
+    setHalfCarryFlag((a & 0x0F) < ((value & 0x0F) + carry));
+    setCarryFlag(a < (value + carry));
 
     CPUreg.af.A = result & 0xFF;
 }
 
-void op_0x90(){ //subtract B from A 4T 1PC
-    subFromA(CPUreg.bc.B);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x91(){ //subtract C from A 4T 1PC
-    subFromA(CPUreg.bc.C);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x92(){ //subtract D from A 4T 1PC
-    subFromA(CPUreg.de.D);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x93(){ //subtract E from A 4T 1PC
-    subFromA(CPUreg.de.E);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x94(){ //subtract H from A 4T 1PC
-    subFromA(CPUreg.hl.H);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x95(){ //subtract L from A 4T 1PC
-    subFromA(CPUreg.hl.L);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x96(){ //subtract value at address HL from A 8T 1PC
-    subFromA(*memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 8;
-}
-
-void op_0x97(){ //subtract A from A 4T 1PC
-    subFromA(CPUreg.af.A);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0x98(){ // subtract Carry Flag + B from A 4T 1PC
-    sbcFromA(CPUreg.bc.B);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x99(){ // subtract Carry Flag + C from A 4T 1PC
-    int carry = getCarryFlag();
-    sbcFromA(CPUreg.bc.C);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x9A(){ // subtract Carry Flag + D from A 4T 1PC
-    sbcFromA(CPUreg.de.D);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x9B(){ // subtract Carry Flag + E from A 4T 1PC
-    sbcFromA(CPUreg.de.E);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x9C(){ // subtract Carry Flag + H from A 4T 1PC
-    sbcFromA(CPUreg.hl.H);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x9D(){ // subtract Carry Flag + L from A 4T 1PC
-    sbcFromA(CPUreg.hl.L);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0x9E() {  // subtract Carry Flag + value at address HL from A 8T 1PC
-    sbcFromA(*memoryMap[CPUreg.hl.HL]);
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8;
-}
-
-void op_0x9F(){ // subtract Carry Flag + A from A 4T 1PC
-    sbcFromA(CPUreg.af.A);
-    CPUreg.PC += 1; 
-    cyclesAccumulated += 4;
-}
-
-void op_0xD6(){ // SUB A, immediate 8T 2PC
-    uint8_t value = *memoryMap[CPUreg.PC + 1];
-    subFromA(value);
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
-
-void op_0xDE(){ // SBC A, immediate (subtract immediate + Carry Flag from A) 8T 2PC
-    uint8_t value = *memoryMap[CPUreg.PC + 1];
-    sbcFromA(value);
-    CPUreg.PC += 2; 
-    cyclesAccumulated += 8;
-}
+void op_0x90() { subFromA(CPUreg.bc.B); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x91() { subFromA(CPUreg.bc.C); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x92() { subFromA(CPUreg.de.D); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x93() { subFromA(CPUreg.de.E); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x94() { subFromA(CPUreg.hl.H); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x95() { subFromA(CPUreg.hl.L); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x96() { subFromA(*memoryMap[CPUreg.hl.HL]); CPUreg.PC += 1; cyclesAccumulated += 8; }
+void op_0x97() { subFromA(CPUreg.af.A); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x98() { sbcFromA(CPUreg.bc.B); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x99() { sbcFromA(CPUreg.bc.C); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x9A() { sbcFromA(CPUreg.de.D); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x9B() { sbcFromA(CPUreg.de.E); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x9C() { sbcFromA(CPUreg.hl.H); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x9D() { sbcFromA(CPUreg.hl.L); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0x9E() { sbcFromA(*memoryMap[CPUreg.hl.HL]); CPUreg.PC += 1; cyclesAccumulated += 8; }
+void op_0x9F() { sbcFromA(CPUreg.af.A); CPUreg.PC += 1; cyclesAccumulated += 4; }
+void op_0xD6() { subFromA(*memoryMap[CPUreg.PC + 1]); CPUreg.PC += 2; cyclesAccumulated += 8; }
+void op_0xDE() { sbcFromA(*memoryMap[CPUreg.PC + 1]); CPUreg.PC += 2; cyclesAccumulated += 8; }
 
 //Yellow AND instructions (bitwise AND operation with 8 bit register) with flags
 void andWithA(uint8_t value) { // bitwise AND operation with register A
@@ -2329,6 +1876,7 @@ void op_0xDA(){ //jump to 16 bit address if carry flag is 1 otherwise do nothing
 void op_0xC3(){ //jump to 16 bit address unconditionally 16T Changes PC to immediate address
     CPUreg.PC = (*memoryMap[CPUreg.PC + 2] << 8) | *memoryMap[CPUreg.PC + 1]; // jump to immediate address
     cyclesAccumulated += 16;
+    //printf("Jumping to address %04X\n", CPUreg.PC);
 }
 
 //Blue rotate non CB
@@ -2388,764 +1936,202 @@ void rotateLeft(uint8_t *dest){
 
 //Rotate left through carry, store MSB in carry flag and rotate LSB to MSB
 
-void op_0xCB00() {  // RLC B
-    uint8_t value = CPUreg.bc.B;
+void rlc(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
     uint8_t msb = (value >> 7) & 0x01;
     value = (value << 1) | msb;
-    CPUreg.bc.B = value;
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
-    setZeroFlag(value == 0);     
+    setZeroFlag(value == 0);
     setCarryFlag(msb);
     setHalfCarryFlag(0);
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB01() {  // RLC C
-    uint8_t value = CPUreg.bc.C;
-    uint8_t msb = (value >> 7) & 0x01;
-    value = (value << 1) | msb;
-    CPUreg.bc.C = value;
+void op_0xCB00() { rlc(&CPUreg.bc.B, false); }
+void op_0xCB01() { rlc(&CPUreg.bc.C, false); }
+void op_0xCB02() { rlc(&CPUreg.de.D, false); }
+void op_0xCB03() { rlc(&CPUreg.de.E, false); }
+void op_0xCB04() { rlc(&CPUreg.hl.H, false); }
+void op_0xCB05() { rlc(&CPUreg.hl.L, false); }
+void op_0xCB06() { rlc(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB07() { rlc(&CPUreg.af.A, false); }
 
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB02() {  // RLC D
-    uint8_t value = CPUreg.de.D;
-    uint8_t msb = (value >> 7) & 0x01;
-    value = (value << 1) | msb;
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB03() {  // RLC E
-    uint8_t value = CPUreg.de.E;
-    uint8_t msb = (value >> 7) & 0x01;
-    value = (value << 1) | msb;
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB04() {  // RLC H
-    uint8_t value = CPUreg.hl.H;
-    uint8_t msb = (value >> 7) & 0x01;
-    value = (value << 1) | msb;
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB05() {  // RLC L
-    uint8_t value = CPUreg.hl.L;
-    uint8_t msb = (value >> 7) & 0x01;
-    value = (value << 1) | msb;
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB06() {  // RLC (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    uint8_t msb = (value >> 7) & 0x01;
-    value = (value << 1) | msb;
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}   
-
-void op_0xCB07() {  // RLC A
-    uint8_t value = CPUreg.af.A;
-    uint8_t msb = (value >> 7) & 0x01;
-    value = (value << 1) | msb;
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
 
  //Rotate right through carry, store LSB in carry flag and rotate MSB to LSB
 
-void op_0xCB08() {  // RRC B
-    uint8_t value = CPUreg.bc.B;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    CPUreg.bc.B = value;
+void rrc(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    uint8_t lsb = value & 0x01;
+    value = (value >> 1) | (lsb << 7);
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
-    setZeroFlag(value == 0);     
+    setZeroFlag(value == 0);
     setCarryFlag(lsb);
     setHalfCarryFlag(0);
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB09() {  // RRC C
-    uint8_t value = CPUreg.bc.C;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    CPUreg.bc.C = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB0A() {  // RRC D
-    uint8_t value = CPUreg.de.D;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB0B() {  // RRC E
-    uint8_t value = CPUreg.de.E;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB0C() {  // RRC H
-    uint8_t value = CPUreg.hl.H;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB0D() {  // RRC L
-    uint8_t value = CPUreg.hl.L;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB0E() {  // RRC (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB0F() {  // RRC A
-    uint8_t value = CPUreg.af.A;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (lsb << 7); // rotate right
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
+void op_0xCB08() { rrc(&CPUreg.bc.B, false); }
+void op_0xCB09() { rrc(&CPUreg.bc.C, false); }
+void op_0xCB0A() { rrc(&CPUreg.de.D, false); }
+void op_0xCB0B() { rrc(&CPUreg.de.E, false); }
+void op_0xCB0C() { rrc(&CPUreg.hl.H, false); }
+void op_0xCB0D() { rrc(&CPUreg.hl.L, false); }
+void op_0xCB0E() { rrc(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB0F() { rrc(&CPUreg.af.A, false); }
 
 // RL 
 
-void op_0xCB10() {  // RL B
-    uint8_t value = CPUreg.bc.B;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    CPUreg.bc.B = value;
+void rl(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    uint8_t msb = (value >> 7) & 0x01;
+    value = (value << 1) | getCarryFlag();
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
-    setZeroFlag(value == 0);     
+    setZeroFlag(value == 0);
     setCarryFlag(msb);
     setHalfCarryFlag(0);
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB11() {  // RL C
-    uint8_t value = CPUreg.bc.C;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    CPUreg.bc.C = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB12() {  // RL D
-    uint8_t value = CPUreg.de.D;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB13() {  // RL E
-    uint8_t value = CPUreg.de.E;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB14() {  // RL H
-    uint8_t value = CPUreg.hl.H;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB15() {  // RL L
-    uint8_t value = CPUreg.hl.L;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB16() {  // RL (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB17() {  // RL A
-    uint8_t value = CPUreg.af.A;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1) | getCarryFlag(); // rotate left and add carry flag to LSB
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
+void op_0xCB10() { rl(&CPUreg.bc.B, false); }
+void op_0xCB11() { rl(&CPUreg.bc.C, false); }
+void op_0xCB12() { rl(&CPUreg.de.D, false); }
+void op_0xCB13() { rl(&CPUreg.de.E, false); }
+void op_0xCB14() { rl(&CPUreg.hl.H, false); }
+void op_0xCB15() { rl(&CPUreg.hl.L, false); }
+void op_0xCB16() { rl(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB17() { rl(&CPUreg.af.A, false); }
 // RR
 
-void op_0xCB18() {  // RR B
-    uint8_t value = CPUreg.bc.B;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    CPUreg.bc.B = value;
+void rr(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    uint8_t lsb = value & 0x01;
+    value = (value >> 1) | (getCarryFlag() << 7);
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
-    setZeroFlag(value == 0);     
+    setZeroFlag(value == 0);
     setCarryFlag(lsb);
     setHalfCarryFlag(0);
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB19() {  // RR C
-    uint8_t value = CPUreg.bc.C;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    CPUreg.bc.C = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB1A() {  // RR D
-    uint8_t value = CPUreg.de.D;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB1B() {  // RR E
-    uint8_t value = CPUreg.de.E;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB1C() {  // RR H
-    uint8_t value = CPUreg.hl.H;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB1D() {  // RR L
-    uint8_t value = CPUreg.hl.L;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB1E() {  // RR (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB1F() {  // RR A
-    uint8_t value = CPUreg.af.A;
-    uint8_t lsb = value & 0x01; // get LSB
-    value = (value >> 1) | (getCarryFlag() << 7); // rotate right and add carry flag to MSB
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
+void op_0xCB18() { rr(&CPUreg.bc.B, false); }
+void op_0xCB19() { rr(&CPUreg.bc.C, false); }
+void op_0xCB1A() { rr(&CPUreg.de.D, false); }
+void op_0xCB1B() { rr(&CPUreg.de.E, false); }
+void op_0xCB1C() { rr(&CPUreg.hl.H, false); }
+void op_0xCB1D() { rr(&CPUreg.hl.L, false); }
+void op_0xCB1E() { rr(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB1F() { rr(&CPUreg.af.A, false); }
 
 //SLA 
 
-void op_0xCB20() {  // SLA B
-    uint8_t value = CPUreg.bc.B;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    CPUreg.bc.B = value;
+void sla(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    uint8_t msb = (value >> 7) & 0x01;
+    value <<= 1;
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
-    setZeroFlag(value == 0);     
+    setZeroFlag(value == 0);
     setCarryFlag(msb);
     setHalfCarryFlag(0);
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB21() {  // SLA C
-    uint8_t value = CPUreg.bc.C;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    CPUreg.bc.C = value;
+void op_0xCB20() { sla(&CPUreg.bc.B, false); }
+void op_0xCB21() { sla(&CPUreg.bc.C, false); }
+void op_0xCB22() { sla(&CPUreg.de.D, false); }
+void op_0xCB23() { sla(&CPUreg.de.E, false); }
+void op_0xCB24() { sla(&CPUreg.hl.H, false); }
+void op_0xCB25() { sla(&CPUreg.hl.L, false); }
+void op_0xCB26() { sla(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB27() { sla(&CPUreg.af.A, false); }
 
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB22() {  // SLA D
-    uint8_t value = CPUreg.de.D;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB23() {  // SLA E
-    uint8_t value = CPUreg.de.E;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB24() {  // SLA H
-    uint8_t value = CPUreg.hl.H;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB25() {  // SLA L
-    uint8_t value = CPUreg.hl.L;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB26() {  // SLA (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB27() {  // SLA A
-    uint8_t value = CPUreg.af.A;
-    uint8_t msb = (value >> 7) & 0x01; // get MSB
-    value = (value << 1); // shift left
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);     
-    setCarryFlag(msb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4; //first PC and 4 cycle done by inital CB instruction
-}
 
 //SRA
 
-void op_0xCB28() {  // SRA B
-    uint8_t value = CPUreg.bc.B;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    CPUreg.bc.B = value;
+void sra(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    uint8_t lsb = value & 0x01;
+    value = (value >> 1) | (value & 0x80);
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
     setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
+    setCarryFlag(lsb);
     setHalfCarryFlag(0);
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4;
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB29() {  // SRA C
-    uint8_t value = CPUreg.bc.C;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    CPUreg.bc.C = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB2A() {  // SRA D
-    uint8_t value = CPUreg.de.D;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB2B() {  // SRA E
-    uint8_t value = CPUreg.de.E;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB2C() {  // SRA H
-    uint8_t value = CPUreg.hl.H;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB2D() {  // SRA L
-    uint8_t value = CPUreg.hl.L;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB2E() {  // SRA (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12;
-}
-
-void op_0xCB2F() {  // SRA A
-    uint8_t value = CPUreg.af.A;
-    uint8_t lsb = value & 0x01;          //bit 0 before shift
-    uint8_t msb = value & 0x80;          //preserve original bit 7
-
-    value = (value >> 1) | msb;          //shift right, keep MSB
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);                   // use LSB for Carry
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+void op_0xCB28() { sra(&CPUreg.bc.B, false); }
+void op_0xCB29() { sra(&CPUreg.bc.C, false); }
+void op_0xCB2A() { sra(&CPUreg.de.D, false); }
+void op_0xCB2B() { sra(&CPUreg.de.E, false); }
+void op_0xCB2C() { sra(&CPUreg.hl.H, false); }
+void op_0xCB2D() { sra(&CPUreg.hl.L, false); }
+void op_0xCB2E() { sra(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB2F() { sra(&CPUreg.af.A, false); }
 
 //SWAP
 
-void op_0xCB30() {  // SWAP B
-    uint8_t value = CPUreg.bc.B;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    CPUreg.bc.B = value;
+void swap(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4);
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
     setZeroFlag(value == 0);
     setCarryFlag(0);
@@ -3153,115 +2139,30 @@ void op_0xCB30() {  // SWAP B
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4;
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB31() {  // SWAP C
-    uint8_t value = CPUreg.bc.C;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    CPUreg.bc.C = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(0);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB32() {  // SWAP D
-    uint8_t value = CPUreg.de.D;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(0);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB33() {  // SWAP E
-    uint8_t value = CPUreg.de.E;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(0);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB34() {  // SWAP H
-    uint8_t value = CPUreg.hl.H;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(0);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB35() {  // SWAP L
-    uint8_t value = CPUreg.hl.L;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(0);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB36() {  // SWAP (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(0);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12;
-}
-
-void op_0xCB37() {  // SWAP A
-    uint8_t value = CPUreg.af.A;
-    value = ((value & 0x0F) << 4) | ((value & 0xF0) >> 4); // swap nibbles
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(0);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+void op_0xCB30() { swap(&CPUreg.bc.B, false); }
+void op_0xCB31() { swap(&CPUreg.bc.C, false); }
+void op_0xCB32() { swap(&CPUreg.de.D, false); }
+void op_0xCB33() { swap(&CPUreg.de.E, false); }
+void op_0xCB34() { swap(&CPUreg.hl.H, false); }
+void op_0xCB35() { swap(&CPUreg.hl.L, false); }
+void op_0xCB36() { swap(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB37() { swap(&CPUreg.af.A, false); }
 
 //SRL
 
-void op_0xCB38() {  // SRL B
-    uint8_t value = CPUreg.bc.B;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    CPUreg.bc.B = value;
+void srl(uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    uint8_t lsb = value & 0x01;
+    value >>= 1;
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
 
     setZeroFlag(value == 0);
     setCarryFlag(lsb);
@@ -3269,1552 +2170,334 @@ void op_0xCB38() {  // SRL B
     setSubtractFlag(0);
 
     CPUreg.PC += 1;
-    cyclesAccumulated += 4;
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB39() {  // SRL C
-    uint8_t value = CPUreg.bc.C;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    CPUreg.bc.C = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB3A() {  // SRL D
-    uint8_t value = CPUreg.de.D;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    CPUreg.de.D = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB3B() {  // SRL E
-    uint8_t value = CPUreg.de.E;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    CPUreg.de.E = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB3C() {  // SRL H
-    uint8_t value = CPUreg.hl.H;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    CPUreg.hl.H = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB3D() {  // SRL L
-    uint8_t value = CPUreg.hl.L;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    CPUreg.hl.L = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB3E() {  // SRL (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    *valuePtr = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12;
-}
-
-void op_0xCB3F() {  // SRL A
-    uint8_t value = CPUreg.af.A;
-    uint8_t lsb = value & 0x01; // get LSB
-    value >>= 1; // shift right
-    CPUreg.af.A = value;
-
-    setZeroFlag(value == 0);
-    setCarryFlag(lsb);
-    setHalfCarryFlag(0);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+void op_0xCB38() { srl(&CPUreg.bc.B, false); }
+void op_0xCB39() { srl(&CPUreg.bc.C, false); }
+void op_0xCB3A() { srl(&CPUreg.de.D, false); }
+void op_0xCB3B() { srl(&CPUreg.de.E, false); }
+void op_0xCB3C() { srl(&CPUreg.hl.H, false); }
+void op_0xCB3D() { srl(&CPUreg.hl.L, false); }
+void op_0xCB3E() { srl(memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB3F() { srl(&CPUreg.af.A, false); }
 
 //BIT
 
-void op_0xCB40() {  // BIT 0, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB41() {  // BIT 0, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB42() {  // BIT 0, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB43() {  // BIT 0, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB44() {  // BIT 0, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB45() {  // BIT 0, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB46() {  // BIT 0, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB47() {  // BIT 0, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x01) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB48() {  // BIT 1, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB49() {  // BIT 1, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB4A() {  // BIT 1, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB4B() {  // BIT 1, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB4C() {  // BIT 1, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB4D() {  // BIT 1, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB4E() {  // BIT 1, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB4F() {  // BIT 1, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x02) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB50() {  // BIT 2, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB51() {  // BIT 2, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB52() {  // BIT 2, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB53() {  // BIT 2, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB54() {  // BIT 2, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB55() {  // BIT 2, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB56() {  // BIT 2, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB57() {  // BIT 2, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x04) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB58() {  // BIT 3, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB59() {  // BIT 3, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-
-void op_0xCB5A() {  // BIT 3, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB5B() {  // BIT 3, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB5C() {  // BIT 3, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB5D() {  // BIT 3, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB5E() {  // BIT 3, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB5F() {  // BIT 3, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x08) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB60() {  // BIT 4, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB61() {  // BIT 4, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB62() {  // BIT 4, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB63() {  // BIT 4, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB64() {  // BIT 4, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB65() {  // BIT 4, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB66() {  // BIT 4, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB67() {  // BIT 4, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x10) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB68() {  // BIT 5, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB69() {  // BIT 5, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB6A() {  // BIT 5, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB6B() {  // BIT 5, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB6C() {  // BIT 5, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB6D() {  // BIT 5, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB6E() {  // BIT 5, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB6F() {  // BIT 5, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x20) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB70() {  // BIT 6, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB71() {  // BIT 6, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB72() {  // BIT 6, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB73() {  // BIT 6, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB74() {  // BIT 6, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB75() {  // BIT 6, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB76() {  // BIT 6, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB77() {  // BIT 6, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x40) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB78() {  // BIT 7, B
-    uint8_t value = CPUreg.bc.B;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB79() {  // BIT 7, C
-    uint8_t value = CPUreg.bc.C;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB7A() {  // BIT 7, D
-    uint8_t value = CPUreg.de.D;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB7B() {  // BIT 7, E
-    uint8_t value = CPUreg.de.E;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB7C() {  // BIT 7, H
-    uint8_t value = CPUreg.hl.H;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB7D() {  // BIT 7, L
-    uint8_t value = CPUreg.hl.L;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB7E() {  // BIT 7, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    uint8_t value = *valuePtr;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
-
-    CPUreg.PC += 1;
-    cyclesAccumulated += 8; //first PC and 4 cycle done by inital CB instruction
-}
+void bitTest(uint8_t bit, uint8_t value, bool isMemory) {
+    setZeroFlag(((value >> bit) & 0x01) == 0);
+    setHalfCarryFlag(1);
+    setSubtractFlag(0);
+
+    CPUreg.PC += 1;
+    cyclesAccumulated += isMemory ? 8 : 4;
+}
+
+// BIT 0
+void op_0xCB40() { bitTest(0, CPUreg.bc.B, false); }
+void op_0xCB41() { bitTest(0, CPUreg.bc.C, false); }
+void op_0xCB42() { bitTest(0, CPUreg.de.D, false); }
+void op_0xCB43() { bitTest(0, CPUreg.de.E, false); }
+void op_0xCB44() { bitTest(0, CPUreg.hl.H, false); }
+void op_0xCB45() { bitTest(0, CPUreg.hl.L, false); }
+void op_0xCB46() { bitTest(0, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB47() { bitTest(0, CPUreg.af.A, false); }
+
+// BIT 1
+void op_0xCB48() { bitTest(1, CPUreg.bc.B, false); }
+void op_0xCB49() { bitTest(1, CPUreg.bc.C, false); }
+void op_0xCB4A() { bitTest(1, CPUreg.de.D, false); }
+void op_0xCB4B() { bitTest(1, CPUreg.de.E, false); }
+void op_0xCB4C() { bitTest(1, CPUreg.hl.H, false); }
+void op_0xCB4D() { bitTest(1, CPUreg.hl.L, false); }
+void op_0xCB4E() { bitTest(1, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB4F() { bitTest(1, CPUreg.af.A, false); }
+
+// BIT 2
+void op_0xCB50() { bitTest(2, CPUreg.bc.B, false); }
+void op_0xCB51() { bitTest(2, CPUreg.bc.C, false); }
+void op_0xCB52() { bitTest(2, CPUreg.de.D, false); }
+void op_0xCB53() { bitTest(2, CPUreg.de.E, false); }
+void op_0xCB54() { bitTest(2, CPUreg.hl.H, false); }
+void op_0xCB55() { bitTest(2, CPUreg.hl.L, false); }
+void op_0xCB56() { bitTest(2, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB57() { bitTest(2, CPUreg.af.A, false); }
+
+// BIT 3
+void op_0xCB58() { bitTest(3, CPUreg.bc.B, false); }
+void op_0xCB59() { bitTest(3, CPUreg.bc.C, false); }
+void op_0xCB5A() { bitTest(3, CPUreg.de.D, false); }
+void op_0xCB5B() { bitTest(3, CPUreg.de.E, false); }
+void op_0xCB5C() { bitTest(3, CPUreg.hl.H, false); }
+void op_0xCB5D() { bitTest(3, CPUreg.hl.L, false); }
+void op_0xCB5E() { bitTest(3, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB5F() { bitTest(3, CPUreg.af.A, false); }
+
+// BIT 4
+void op_0xCB60() { bitTest(4, CPUreg.bc.B, false); }
+void op_0xCB61() { bitTest(4, CPUreg.bc.C, false); }
+void op_0xCB62() { bitTest(4, CPUreg.de.D, false); }
+void op_0xCB63() { bitTest(4, CPUreg.de.E, false); }
+void op_0xCB64() { bitTest(4, CPUreg.hl.H, false); }
+void op_0xCB65() { bitTest(4, CPUreg.hl.L, false); }
+void op_0xCB66() { bitTest(4, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB67() { bitTest(4, CPUreg.af.A, false); }
+
+// BIT 5
+void op_0xCB68() { bitTest(5, CPUreg.bc.B, false); }
+void op_0xCB69() { bitTest(5, CPUreg.bc.C, false); }
+void op_0xCB6A() { bitTest(5, CPUreg.de.D, false); }
+void op_0xCB6B() { bitTest(5, CPUreg.de.E, false); }
+void op_0xCB6C() { bitTest(5, CPUreg.hl.H, false); }
+void op_0xCB6D() { bitTest(5, CPUreg.hl.L, false); }
+void op_0xCB6E() { bitTest(5, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB6F() { bitTest(5, CPUreg.af.A, false); }
+
+// BIT 6
+void op_0xCB70() { bitTest(6, CPUreg.bc.B, false); }
+void op_0xCB71() { bitTest(6, CPUreg.bc.C, false); }
+void op_0xCB72() { bitTest(6, CPUreg.de.D, false); }
+void op_0xCB73() { bitTest(6, CPUreg.de.E, false); }
+void op_0xCB74() { bitTest(6, CPUreg.hl.H, false); }
+void op_0xCB75() { bitTest(6, CPUreg.hl.L, false); }
+void op_0xCB76() { bitTest(6, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB77() { bitTest(6, CPUreg.af.A, false); }
+
+// BIT 7
+void op_0xCB78() { bitTest(7, CPUreg.bc.B, false); }
+void op_0xCB79() { bitTest(7, CPUreg.bc.C, false); }
+void op_0xCB7A() { bitTest(7, CPUreg.de.D, false); }
+void op_0xCB7B() { bitTest(7, CPUreg.de.E, false); }
+void op_0xCB7C() { bitTest(7, CPUreg.hl.H, false); }
+void op_0xCB7D() { bitTest(7, CPUreg.hl.L, false); }
+void op_0xCB7E() { bitTest(7, *memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB7F() { bitTest(7, CPUreg.af.A, false); }
 
-void op_0xCB7F() {  // BIT 7, A
-    uint8_t value = CPUreg.af.A;
-    setZeroFlag((value & 0x80) == 0);
-    setHalfCarryFlag(1);
-    setSubtractFlag(0);
 
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
 
 //RES
 
-void op_0xCB80() {  // RES 0, B
-    CPUreg.bc.B &= ~0x01; // clear bit 0
+void resBit(uint8_t bit, uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg; // get current value of the register or memory location
+    value &= ~(1 << bit); // clear the specified bit
+    if (isMemory) {
+
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
     CPUreg.PC += 1;
-    cyclesAccumulated += 4;
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCB81() {  // RES 0, C
-    CPUreg.bc.C &= ~0x01; // clear bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// RES 0
+void op_0xCB80() { resBit(0, &CPUreg.bc.B, false); }
+void op_0xCB81() { resBit(0, &CPUreg.bc.C, false); }
+void op_0xCB82() { resBit(0, &CPUreg.de.D, false); }
+void op_0xCB83() { resBit(0, &CPUreg.de.E, false); }
+void op_0xCB84() { resBit(0, &CPUreg.hl.H, false); }
+void op_0xCB85() { resBit(0, &CPUreg.hl.L, false); }
+void op_0xCB86() { resBit(0, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB87() { resBit(0, &CPUreg.af.A, false); }
 
-void op_0xCB82() {  // RES 0, D
-    CPUreg.de.D &= ~0x01; // clear bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// RES 1
+void op_0xCB88() { resBit(1, &CPUreg.bc.B, false); }
+void op_0xCB89() { resBit(1, &CPUreg.bc.C, false); }
+void op_0xCB8A() { resBit(1, &CPUreg.de.D, false); }
+void op_0xCB8B() { resBit(1, &CPUreg.de.E, false); }
+void op_0xCB8C() { resBit(1, &CPUreg.hl.H, false); }
+void op_0xCB8D() { resBit(1, &CPUreg.hl.L, false); }
+void op_0xCB8E() { resBit(1, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB8F() { resBit(1, &CPUreg.af.A, false); }
 
-void op_0xCB83() {  // RES 0, E
-    CPUreg.de.E &= ~0x01; // clear bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// RES 2
+void op_0xCB90() { resBit(2, &CPUreg.bc.B, false); }
+void op_0xCB91() { resBit(2, &CPUreg.bc.C, false); }
+void op_0xCB92() { resBit(2, &CPUreg.de.D, false); }
+void op_0xCB93() { resBit(2, &CPUreg.de.E, false); }
+void op_0xCB94() { resBit(2, &CPUreg.hl.H, false); }
+void op_0xCB95() { resBit(2, &CPUreg.hl.L, false); }
+void op_0xCB96() { resBit(2, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB97() { resBit(2, &CPUreg.af.A, false); }
 
-void op_0xCB84() {  // RES 0, H
-    CPUreg.hl.H &= ~0x01; // clear bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// RES 3
+void op_0xCB98() { resBit(3, &CPUreg.bc.B, false); }
+void op_0xCB99() { resBit(3, &CPUreg.bc.C, false); }
+void op_0xCB9A() { resBit(3, &CPUreg.de.D, false); }
+void op_0xCB9B() { resBit(3, &CPUreg.de.E, false); }
+void op_0xCB9C() { resBit(3, &CPUreg.hl.H, false); }
+void op_0xCB9D() { resBit(3, &CPUreg.hl.L, false); }
+void op_0xCB9E() { resBit(3, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCB9F() { resBit(3, &CPUreg.af.A, false); }
 
-void op_0xCB85() {  // RES 0, L
-    CPUreg.hl.L &= ~0x01; // clear bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// RES 4
+void op_0xCBA0() { resBit(4, &CPUreg.bc.B, false); }
+void op_0xCBA1() { resBit(4, &CPUreg.bc.C, false); }
+void op_0xCBA2() { resBit(4, &CPUreg.de.D, false); }
+void op_0xCBA3() { resBit(4, &CPUreg.de.E, false); }
+void op_0xCBA4() { resBit(4, &CPUreg.hl.H, false); }
+void op_0xCBA5() { resBit(4, &CPUreg.hl.L, false); }
+void op_0xCBA6() { resBit(4, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBA7() { resBit(4, &CPUreg.af.A, false); }
 
-void op_0xCB86() {  // RES 0, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x01; // clear bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
+// RES 5
+void op_0xCBA8() { resBit(5, &CPUreg.bc.B, false); }
+void op_0xCBA9() { resBit(5, &CPUreg.bc.C, false); }
+void op_0xCBAA() { resBit(5, &CPUreg.de.D, false); }
+void op_0xCBAB() { resBit(5, &CPUreg.de.E, false); }
+void op_0xCBAC() { resBit(5, &CPUreg.hl.H, false); }
+void op_0xCBAD() { resBit(5, &CPUreg.hl.L, false); }
+void op_0xCBAE() { resBit(5, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBAF() { resBit(5, &CPUreg.af.A, false); }
 
-void op_0xCB87() {  // RES 0, A
-    CPUreg.af.A &= ~0x01; // clear bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// RES 6
+void op_0xCBB0() { resBit(6, &CPUreg.bc.B, false); }
+void op_0xCBB1() { resBit(6, &CPUreg.bc.C, false); }
+void op_0xCBB2() { resBit(6, &CPUreg.de.D, false); }
+void op_0xCBB3() { resBit(6, &CPUreg.de.E, false); }
+void op_0xCBB4() { resBit(6, &CPUreg.hl.H, false); }
+void op_0xCBB5() { resBit(6, &CPUreg.hl.L, false); }
+void op_0xCBB6() { resBit(6, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBB7() { resBit(6, &CPUreg.af.A, false); }
 
-void op_0xCB88() {  // RES 1, B
-    CPUreg.bc.B &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
+// RES 7
+void op_0xCBB8() { resBit(7, &CPUreg.bc.B, false); }
+void op_0xCBB9() { resBit(7, &CPUreg.bc.C, false); }
+void op_0xCBBA() { resBit(7, &CPUreg.de.D, false); }
+void op_0xCBBB() { resBit(7, &CPUreg.de.E, false); }
+void op_0xCBBC() { resBit(7, &CPUreg.hl.H, false); }
+void op_0xCBBD() { resBit(7, &CPUreg.hl.L, false); }
+void op_0xCBBE() { 
+    resBit(7, memoryMap[CPUreg.hl.HL], true);
+    /*
+    if(CPUreg.hl.HL == 0xFF40 ) { //disable LCD
+    *memoryMap[0xFF44] = 0; // Reset LY to 0
+        *memoryMap[0xFF41] = (*memoryMap[0xFF41] & ~0x03) | 0x00; // Set mode to 0 (HBlank)
+        *memoryMap[0xFF41] &= ~(1 << 2); // Coincidence flag cleared (unless LY==LYC)
+        mode0Timer = 0;
+        mode1Timer = 0;
+        mode2Timer = 0;
+        scanlineTimer = 0;
+        xPos = 0;
+        LCDdisabled = 1; // Set LCD disabled flag
+        newScanLine = 1;
+        fetchStage.objectFetchStage = 0; // Reset object fetch stage
+        fetchStage.BGFetchStage = 0; // Reset background fetch stage
+        fetchStage.windowFetchMode = 0; // Reset window fetch mode
+        for (int i = 0; i < 8; i++) { // Clear BGFifo
+            Pixel discard;
+            dequeue(&BGFifo, &discard);
+            dequeue(&SpriteFifo, &discard); // Clear SpriteFifo as well
+    }
+    fprintf(logFile, "LCDC disabled CBBE, cycle: %ld\n", realCyclesAccumulated);
+ }
+    */
 }
-
-void op_0xCB89() {  // RES 1, C
-    CPUreg.bc.C &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB8A() {  // RES 1, D
-    CPUreg.de.D &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB8B() {  // RES 1, E
-    CPUreg.de.E &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB8C() {  // RES 1, H
-    CPUreg.hl.H &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB8D() {  // RES 1, L
-    CPUreg.hl.L &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB8E() {  // RES 1, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB8F() {  // RES 1, A
-    CPUreg.af.A &= ~0x02; // clear bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB90() {  // RES 2, B
-    CPUreg.bc.B &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB91() {  // RES 2, C
-    CPUreg.bc.C &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB92() {  // RES 2, D
-    CPUreg.de.D &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB93() {  // RES 2, E
-    CPUreg.de.E &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB94() {  // RES 2, H
-    CPUreg.hl.H &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB95() {  // RES 2, L
-    CPUreg.hl.L &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB96() {  // RES 2, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB97() {  // RES 2, A
-    CPUreg.af.A &= ~0x04; // clear bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB98() {  // RES 3, B
-    CPUreg.bc.B &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB99() {  // RES 3, C
-    CPUreg.bc.C &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB9A() {  // RES 3, D
-    CPUreg.de.D &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-void op_0xCB9B() {  // RES 3, E
-    CPUreg.de.E &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB9C() {  // RES 3, H
-    CPUreg.hl.H &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB9D() {  // RES 3, L
-    CPUreg.hl.L &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCB9E() {  // RES 3, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCB9F() {  // RES 3, A
-    CPUreg.af.A &= ~0x08; // clear bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA0() {  // RES 4, B
-    CPUreg.bc.B &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA1() {  // RES 4, C
-    CPUreg.bc.C &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA2() {  // RES 4, D
-    CPUreg.de.D &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA3() {  // RES 4, E
-    CPUreg.de.E &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA4() {  // RES 4, H
-    CPUreg.hl.H &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA5() {  // RES 4, L
-    CPUreg.hl.L &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA6() {  // RES 4, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBA7() {  // RES 4, A
-    CPUreg.af.A &= ~0x10; // clear bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA8() {  // RES 5, B
-    CPUreg.bc.B &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBA9() {  // RES 5, C
-    CPUreg.bc.C &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBAA() {  // RES 5, D
-    CPUreg.de.D &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBAB() {  // RES 5, E
-    CPUreg.de.E &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBAC() {  // RES 5, H
-    CPUreg.hl.H &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBAD() {  // RES 5, L
-    CPUreg.hl.L &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBAE() {  // RES 5, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBAF() {  // RES 5, A
-    CPUreg.af.A &= ~0x20; // clear bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB0() {  // RES 6, B
-    CPUreg.bc.B &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB1() {  // RES 6, C
-    CPUreg.bc.C &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB2() {  // RES 6, D
-    CPUreg.de.D &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB3() {  // RES 6, E
-    CPUreg.de.E &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB4() {  // RES 6, H
-    CPUreg.hl.H &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB5() {  // RES 6, L
-    CPUreg.hl.L &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB6() {  // RES 6, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBB7() {  // RES 6, A
-    CPUreg.af.A &= ~0x40; // clear bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB8() {  // RES 7, B
-    CPUreg.bc.B &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBB9() {  // RES 7, C
-    CPUreg.bc.C &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBBA() {  // RES 7, D
-    CPUreg.de.D &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBBB() {  // RES 7, E
-    CPUreg.de.E &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBBC() {  // RES 7, H
-    CPUreg.hl.H &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBBD() {  // RES 7, L
-    CPUreg.hl.L &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBBE() {  // RES 7, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBBF() {  // RES 7, A
-    CPUreg.af.A &= ~0x80; // clear bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+void op_0xCBBF() { resBit(7, &CPUreg.af.A, false); }
 
 //SET
 
-void op_0xCBC0() {  // SET 0, B
-    CPUreg.bc.B |= 0x01; // set bit 0
+void setBit(uint8_t bit, uint8_t* reg, bool isMemory) {
+    uint8_t value = *reg;
+    value |= (1 << bit);
+    if (isMemory) {
+        LDVal8(value, memoryMap[CPUreg.hl.HL], CPUreg.hl.HL, 1, 0xFFFF); // if memory, store value in memory
+    }
+    else{
+        *reg = value;
+    }
     CPUreg.PC += 1;
-    cyclesAccumulated += 4;
+    cyclesAccumulated += isMemory ? 12 : 4;
 }
 
-void op_0xCBC1() {  // SET 0, C
-    CPUreg.bc.C |= 0x01; // set bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// SET 0
+void op_0xCBC0() { setBit(0, &CPUreg.bc.B, false); }
+void op_0xCBC1() { setBit(0, &CPUreg.bc.C, false); }
+void op_0xCBC2() { setBit(0, &CPUreg.de.D, false); }
+void op_0xCBC3() { setBit(0, &CPUreg.de.E, false); }
+void op_0xCBC4() { setBit(0, &CPUreg.hl.H, false); }
+void op_0xCBC5() { setBit(0, &CPUreg.hl.L, false); }
+void op_0xCBC6() { setBit(0, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBC7() { setBit(0, &CPUreg.af.A, false); }
 
-void op_0xCBC2() {  // SET 0, D
-    CPUreg.de.D |= 0x01; // set bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// SET 1
+void op_0xCBC8() { setBit(1, &CPUreg.bc.B, false); }
+void op_0xCBC9() { setBit(1, &CPUreg.bc.C, false); }
+void op_0xCBCA() { setBit(1, &CPUreg.de.D, false); }
+void op_0xCBCB() { setBit(1, &CPUreg.de.E, false); }
+void op_0xCBCC() { setBit(1, &CPUreg.hl.H, false); }
+void op_0xCBCD() { setBit(1, &CPUreg.hl.L, false); }
+void op_0xCBCE() { setBit(1, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBCF() { setBit(1, &CPUreg.af.A, false); }
 
-void op_0xCBC3() {  // SET 0, E
-    CPUreg.de.E |= 0x01; // set bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// SET 2
+void op_0xCBD0() { setBit(2, &CPUreg.bc.B, false); }
+void op_0xCBD1() { setBit(2, &CPUreg.bc.C, false); }
+void op_0xCBD2() { setBit(2, &CPUreg.de.D, false); }
+void op_0xCBD3() { setBit(2, &CPUreg.de.E, false); }
+void op_0xCBD4() { setBit(2, &CPUreg.hl.H, false); }
+void op_0xCBD5() { setBit(2, &CPUreg.hl.L, false); }
+void op_0xCBD6() { setBit(2, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBD7() { setBit(2, &CPUreg.af.A, false); }
 
-void op_0xCBC4() {  // SET 0, H
-    CPUreg.hl.H |= 0x01; // set bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// SET 3
+void op_0xCBD8() { setBit(3, &CPUreg.bc.B, false); }
+void op_0xCBD9() { setBit(3, &CPUreg.bc.C, false); }
+void op_0xCBDA() { setBit(3, &CPUreg.de.D, false); }
+void op_0xCBDB() { setBit(3, &CPUreg.de.E, false); }
+void op_0xCBDC() { setBit(3, &CPUreg.hl.H, false); }
+void op_0xCBDD() { setBit(3, &CPUreg.hl.L, false); }
+void op_0xCBDE() { setBit(3, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBDF() { setBit(3, &CPUreg.af.A, false); }
 
-void op_0xCBC5() {  // SET 0, L
-    CPUreg.hl.L |= 0x01; // set bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// SET 4
+void op_0xCBE0() { setBit(4, &CPUreg.bc.B, false); }
+void op_0xCBE1() { setBit(4, &CPUreg.bc.C, false); }
+void op_0xCBE2() { setBit(4, &CPUreg.de.D, false); }
+void op_0xCBE3() { setBit(4, &CPUreg.de.E, false); }
+void op_0xCBE4() { setBit(4, &CPUreg.hl.H, false); }
+void op_0xCBE5() { setBit(4, &CPUreg.hl.L, false); }
+void op_0xCBE6() { setBit(4, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBE7() { setBit(4, &CPUreg.af.A, false); }
 
-void op_0xCBC6() {  // SET 0, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x01; // set bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
+// SET 5
+void op_0xCBE8() { setBit(5, &CPUreg.bc.B, false); }
+void op_0xCBE9() { setBit(5, &CPUreg.bc.C, false); }
+void op_0xCBEA() { setBit(5, &CPUreg.de.D, false); }
+void op_0xCBEB() { setBit(5, &CPUreg.de.E, false); }
+void op_0xCBEC() { setBit(5, &CPUreg.hl.H, false); }
+void op_0xCBED() { setBit(5, &CPUreg.hl.L, false); }
+void op_0xCBEE() { setBit(5, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBEF() { setBit(5, &CPUreg.af.A, false); }
 
-void op_0xCBC7() {  // SET 0, A
-    CPUreg.af.A |= 0x01; // set bit 0
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// SET 6
+void op_0xCBF0() { setBit(6, &CPUreg.bc.B, false); }
+void op_0xCBF1() { setBit(6, &CPUreg.bc.C, false); }
+void op_0xCBF2() { setBit(6, &CPUreg.de.D, false); }
+void op_0xCBF3() { setBit(6, &CPUreg.de.E, false); }
+void op_0xCBF4() { setBit(6, &CPUreg.hl.H, false); }
+void op_0xCBF5() { setBit(6, &CPUreg.hl.L, false); }
+void op_0xCBF6() { setBit(6, memoryMap[CPUreg.hl.HL], true); }
+void op_0xCBF7() { setBit(6, &CPUreg.af.A, false); }
 
-void op_0xCBC8() {  // SET 1, B
-    CPUreg.bc.B |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBC9() {  // SET 1, C
-    CPUreg.bc.C |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBCA() {  // SET 1, D
-    CPUreg.de.D |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBCB() {  // SET 1, E
-    CPUreg.de.E |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBCC() {  // SET 1, H
-    CPUreg.hl.H |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBCD() {  // SET 1, L
-    CPUreg.hl.L |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBCE() {  // SET 1, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBCF() {  // SET 1, A
-    CPUreg.af.A |= 0x02; // set bit 1
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD0() {  // SET 2, B
-    CPUreg.bc.B |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD1() {  // SET 2, C
-    CPUreg.bc.C |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD2() {  // SET 2, D
-    CPUreg.de.D |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD3() {  // SET 2, E
-    CPUreg.de.E |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD4() {  // SET 2, H
-    CPUreg.hl.H |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD5() {  // SET 2, L
-    CPUreg.hl.L |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD6() {  // SET 2, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBD7() {  // SET 2, A
-    CPUreg.af.A |= 0x04; // set bit 2
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD8() {  // SET 3, B
-    CPUreg.bc.B |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBD9() {  // SET 3, C
-    CPUreg.bc.C |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBDA() {  // SET 3, D
-    CPUreg.de.D |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBDB() {  // SET 3, E
-    CPUreg.de.E |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBDC() {  // SET 3, H
-    CPUreg.hl.H |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBDD() {  // SET 3, L
-    CPUreg.hl.L |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBDE() {  // SET 3, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBDF() {  // SET 3, A
-    CPUreg.af.A |= 0x08; // set bit 3
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE0() {  // SET 4, B
-    CPUreg.bc.B |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE1() {  // SET 4, C
-    CPUreg.bc.C |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE2() {  // SET 4, D
-    CPUreg.de.D |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE3() {  // SET 4, E
-    CPUreg.de.E |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE4() {  // SET 4, H
-    CPUreg.hl.H |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE5() {  // SET 4, L
-    CPUreg.hl.L |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE6() {  // SET 4, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBE7() {  // SET 4, A
-    CPUreg.af.A |= 0x10; // set bit 4
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE8() {  // SET 5, B
-    CPUreg.bc.B |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBE9() {  // SET 5, C
-    CPUreg.bc.C |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBEA() {  // SET 5, D
-    CPUreg.de.D |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBEB() {  // SET 5, E
-    CPUreg.de.E |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBEC() {  // SET 5, H
-    CPUreg.hl.H |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBED() {  // SET 5, L
-    CPUreg.hl.L |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBEE() {  // SET 5, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBEF() {  // SET 5, A
-    CPUreg.af.A |= 0x20; // set bit 5
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF0() {  // SET 6, B
-    CPUreg.bc.B |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF1() {  // SET 6, C
-    CPUreg.bc.C |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}   
-
-void op_0xCBF2() {  // SET 6, D
-    CPUreg.de.D |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF3() {  // SET 6, E
-    CPUreg.de.E |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF4() {  // SET 6, H
-    CPUreg.hl.H |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF5() {  // SET 6, L
-    CPUreg.hl.L |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF6() {  // SET 6, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBF7() {  // SET 6, A
-    CPUreg.af.A |= 0x40; // set bit 6
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF8() {  // SET 7, B
-    CPUreg.bc.B |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBF9() {  // SET 7, C
-    CPUreg.bc.C |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBFA() {  // SET 7, D
-    CPUreg.de.D |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBFB() {  // SET 7, E
-    CPUreg.de.E |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBFC() {  // SET 7, H
-    CPUreg.hl.H |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBFD() {  // SET 7, L
-    CPUreg.hl.L |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
-
-void op_0xCBFE() {  // SET 7, (HL)
-    uint8_t *valuePtr = memoryMap[CPUreg.hl.HL];
-    *valuePtr |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 12; //first PC and 4 cycle done by inital CB instruction
-}
-
-void op_0xCBFF() {  // SET 7, A
-    CPUreg.af.A |= 0x80; // set bit 7
-    CPUreg.PC += 1;
-    cyclesAccumulated += 4;
-}
+// SET 7
+void op_0xCBF8() { setBit(7, &CPUreg.bc.B, false); }
+void op_0xCBF9() { setBit(7, &CPUreg.bc.C, false); }
+void op_0xCBFA() { setBit(7, &CPUreg.de.D, false); }
+void op_0xCBFB() { setBit(7, &CPUreg.de.E, false); }
+void op_0xCBFC() { setBit(7, &CPUreg.hl.H, false); }
+void op_0xCBFD() { setBit(7, &CPUreg.hl.L, false); }
+void op_0xCBFE() { 
+    setBit(7, memoryMap[CPUreg.hl.HL], true);
+    /*
+    if (CPUreg.hl.HL == 0xFF40 && LCDdisabled == 1) {
+        LCDdelayflag = 4; // Set LCD delay flag to turn back on
+        fprintf(logFile, "LCDC delay flag from CBFE, cycle: %ld\n", realCyclesAccumulated);
+    }
+        */
+ }
+void op_0xCBFF() { setBit(7, &CPUreg.af.A, false); }
 
 int CBFlag = 0; //CB flag to indicate if CB instruction is being executed
 void op_0xCB(){
@@ -5414,12 +3097,15 @@ typedef struct {
 
 //OAM Queue 80 clocks, first 10 sprites
 
+
+
 typedef struct {
     uint8_t yPos; //first byte Y=16 is top of screen y < 16 has pixels chopped
     uint8_t xPos; //2nd byte X=8 is left of screen, x < 8 has pixels chopped 
     uint8_t tileNum; //third byte start from 8000
     uint8_t flags; //4th byte
 } Sprite; //Structure to hold sprite attributes for each sprite
+
 
 int spriteSearchOAM(uint8_t ly, Sprite* buffer) { //pass in sprite array of size 10
     int count = 0; //track number of sprites in buffer currently
@@ -5452,67 +3138,24 @@ int spriteSearchOAM(uint8_t ly, Sprite* buffer) { //pass in sprite array of size
             }
         }
     }
+    
+        for (int i = 0; i < count - 1; i++) {
+        for (int j = 0; j < count - i - 1; j++) {
+            if (buffer[j].xPos > buffer[j + 1].xPos) {
+                Sprite tmp = buffer[j];
+                buffer[j] = buffer[j + 1];
+                buffer[j + 1] = tmp;
+            }
+        }
+    }
+    
+
     return count; //returns how many sprites in the sprite buffer
 }
 
-typedef struct {
-    uint8_t colour;
-    uint8_t palette;
-    int bg_priority;
-    int is_sprite;
-    uint8_t sprite_index;
-} Pixel;
+int windowLine = 0;
 
-typedef struct {
-    Pixel data[8]; // array to store queue elements
-    int count;  // number of elements in the queue
-}Queue; //Use for FIFO
-
-// Initialize queue
-void initQueue(Queue* q) {
-    q->count = 0;
-}
-
-// Check if empty
-int isEmpty(Queue* q) {
-    return q->count == 0;
-}
-
-// Check if full
-int isFull(Queue* q) {
-    return q->count == 8;
-}
-
-// Enqueue value
-int enqueue(Queue* q, Pixel pixel) {
-    if (isFull(q)) return 1;
-    q->data[q->count++] = pixel;
-    //printf("Enqueued pixel, new count=%d\n", q->count);
-    return 0;
-}
-
-// Dequeue and shift
-int dequeue(Queue* q, Pixel* pixel) {
-    if (isEmpty(q)) return 0;
-
-    *pixel = q->data[0];
-
-    // Shift elements
-    for (int i = 1; i < q->count; i++) {
-        q->data[i - 1] = q->data[i];
-    }
-
-    q->count--;
-    return 1;
-}
-
-typedef struct {
-    int BGFetchStage; //background
-    int objectFetchStage; //sprite
-    int windowFetchMode; //window 
-} fetchStage;
-
-void pixelPushBG(Queue* fifo, uint8_t xPos, fetchStage* stage, int fetchWindow) { //retrieve pixels tiles and push current tile row to FIFO Queue 
+void pixelPushBG(Queue* fifo, uint8_t xPos, FetchStage* stage, int fetchWindow) { //retrieve pixels tiles and push current tile row to FIFO Queue 
     //printf("pixelPushBG called, queue count=%d\n", fifo->count);
     if (isEmpty(fifo)) { //Queue must be empty before allowing more pixels to be pushed
         //printf("pixelPushBG: queue is empty, filling...\n");
@@ -5532,7 +3175,8 @@ void pixelPushBG(Queue* fifo, uint8_t xPos, fetchStage* stage, int fetchWindow) 
 
             // Window coordinates relative to window start, NO scrolling applied
             mapX = xPos - (wx - 7);
-            mapY = ly - wy;
+            mapY = windowLine; //ly - wy;
+          //  printf("Window line: %d, LY: %d\n", windowLine, ly);
         } else { //if fetching background tile
             // Background tile map base depends on LCDC bit 3
             tileMapBase = (lcdc & 0x08) ? 0x9C00 : 0x9800;
@@ -5542,7 +3186,7 @@ void pixelPushBG(Queue* fifo, uint8_t xPos, fetchStage* stage, int fetchWindow) 
             mapY = (ly + scy) & 0xFF; //y scroll added with wrap 0-255
 
             uint8_t scx = *memoryMap[0xFF43];
-            mapX = (xPos + scx) & 0xFF;
+            mapX = (xPos + scx) & 0xFF; //coarse scroll
         }
 
         // Make sure mapX and mapY are valid (0-255)
@@ -5582,7 +3226,7 @@ void pixelPushBG(Queue* fifo, uint8_t xPos, fetchStage* stage, int fetchWindow) 
             enqueue(fifo, p);
         }
         stage->BGFetchStage = 0;
-       // printf("TileNum: %d, Addr: 0x%04X, line=%d, byte1=0x%02X, byte2=0x%02X\n", tileNum, tileAddr, line, byte1, byte2);
+      // printf("TileNum: %d, Addr: 0x%04X, line=%d, byte1=0x%02X, byte2=0x%02X, TileIndexAddr: 0x%04X, TileRow=%d, TileCol=%d, tileMapBase=%04X, LCDC: 0x%02X, xPos: %d, scx: %d, scy: %d, fetchWindow: %d, wx: %d, windowLine: %d, PC: %04X, wy: %d, windowFetchMode: %d, IE: 0x%02X, IF: 0x%02X, IME: %d\n", tileNum, tileAddr, line, byte1, byte2, tileIndexAddr, tileRow, tileCol, tileMapBase, lcdc, xPos, *memoryMap[0xFF43], *memoryMap[0xFF42], fetchWindow, *memoryMap[0xFF4B], windowLine, CPUreg.PC, *memoryMap[0xFF4A], fetchStage.windowFetchMode, *memoryMap[0xFFFF], *memoryMap[0xFF0F], CPUreg.IME);
     }
     
 }
@@ -5627,17 +3271,24 @@ void drawDisplay(SDL_Renderer *renderer){
     }
 }
 
-int scxCounter = 0;
-int newScanLine = 1;
+
+int CPUtimer = 0; //timer for CPU cycles
 
 void handleInterrupts() {
-    if (CPUreg.IME == 0) return; // Interrupts disabled
-
     uint8_t IE = *memoryMap[0xFFFF]; // Interrupt Enable
     uint8_t IF = *memoryMap[0xFF0F]; // Interrupt Flag
+
+    if (haltMode == 1 && (IE & IF & 0x1F) != 0) {
+        haltMode = 0; // CPU will resume 
+    }
+
+    if (CPUreg.IME == 0) return; // Interrupts disabled
+
     uint8_t fired = IE & IF;
 
     if (!fired) return; // No interrupt requested
+
+    //printf("Interrupt Called: IE=0x%02X IF=0x%02X IME=%d (PC=%04X)\n", IE, IF, CPUreg.IME, CPUreg.PC);
 
     // Interrupt priorities: VBlank > LCD STAT > Timer > Serial > Joypad
     struct { uint8_t mask; uint16_t vector; } interrupts[] = {
@@ -5671,7 +3322,7 @@ void handleInterrupts() {
             }
                 */
             //printf("INT fired: type=%d, pushing PC=%04X to SP=%04X\n", i, CPUreg.PC, CPUreg.SP);
-            //printf("[INTERRUPT] IE=0x%02X IF=0x%02X IME=%d (PC=%04X) Cycles=%d\n",*memoryMap[0xFFFF], *memoryMap[0xFF0F], CPUreg.IME, CPUreg.PC, realCyclesAccumulated);
+            //printf("[INTERRUPT] IE=0x%02X IF=0x%02X IME=%d (PC=%04X) \n",*memoryMap[0xFFFF], *memoryMap[0xFF0F], CPUreg.IME, CPUreg.PC);
             //printf("IF AFTER:  0x%02X\n", *memoryMap[0xFF0F]);
             //fprintf(logFile, "[INTERRUPT] IE=0x%02X IF=0x%02X IME=%d (PC=%04X) Cycles=%d\n", *memoryMap[0xFFFF], *memoryMap[0xFF0F], CPUreg.IME, CPUreg.PC, realCyclesAccumulated);
 
@@ -5723,18 +3374,98 @@ void drawTileViewer(SDL_Renderer *renderer) {
     SDL_RenderPresent(renderer);
 }
 
+    int isPaused = 0;
+    int stepMode = 0;
+
+void renderText(SDL_Renderer *renderer, TTF_Font *font, const char *text, int x, int y) {
+    SDL_Color white = {255, 255, 255, 255};
+    SDL_Surface *surface = TTF_RenderText_Solid(font, text, white);
+    SDL_Texture *texture = SDL_CreateTextureFromSurface(renderer, surface);
+
+    SDL_Rect dest = {x, y, surface->w, surface->h};
+    SDL_RenderCopy(renderer, texture, NULL, &dest);
+
+    SDL_FreeSurface(surface);
+    SDL_DestroyTexture(texture);
+}
+
+void drawDebugWindow(SDL_Renderer *renderer, TTF_Font *font) {
+    char line[64];
+    int y = 10;
+    uint8_t opcode = *memoryMap[CPUreg.PC];
+
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderClear(renderer);
+
+    sprintf(line, "AF = %04X", CPUreg.af.AF); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "BC = %04X", CPUreg.bc.BC); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "DE = %04X", CPUreg.de.DE); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "HL = %04X", CPUreg.hl.HL); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "SP = %04X", CPUreg.SP);   renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "PC = %04X", CPUreg.PC);   renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "IME = %d", CPUreg.IME);   renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "opCode = %02X", opcode);   renderText(renderer, font, line, 10, y); y += 18;
+
+    renderText(renderer, font, "Memory:", 10, y); y += 18;
+    sprintf(line, "FF00 = %02X", *memoryMap[0xFF00]); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "FF41 = %02X", *memoryMap[0xFF41]); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "FF85 = %02X", *memoryMap[0xFF85]); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "FF0F = %02X", *memoryMap[0xFF0F]); renderText(renderer, font, line, 10, y); y += 18;
+    sprintf(line, "FFFF = %02X", *memoryMap[0xFFFF]); renderText(renderer, font, line, 10, y); y += 18;
+
+    sprintf(line, "Pause = %d", isPaused); renderText(renderer, font, line, 10, y); y += 18;
+
+    renderText(renderer, font, "Sprites:", 10, y); y += 18;
+
+    for (int i = 0; i < 5; i++) {
+        uint8_t yPos = *memoryMap[0xFE00 + i * 4 + 0];
+        uint8_t xPos = *memoryMap[0xFE00 + i * 4 + 1];
+        uint8_t tile = *memoryMap[0xFE00 + i * 4 + 2];
+        uint8_t attr = *memoryMap[0xFE00 + i * 4 + 3];
+        sprintf(line, "%02X %02X T:%02X A:%02X", xPos, yPos, tile, attr);
+        renderText(renderer, font, line, 10, y);
+        y += 18;
+    }
+
+    SDL_RenderPresent(renderer);
+}
+
+void checkLYC(uint8_t* memoryMap[0x10000]) {
+    static uint8_t wasEqual = 0; //prevent repeated interrupt on same line
+
+    uint8_t ly  = *memoryMap[0xFF44];
+    uint8_t lyc = *memoryMap[0xFF45];
+    uint8_t* stat = memoryMap[0xFF41];
+    uint8_t* if_reg = memoryMap[0xFF0F];
+
+    uint8_t equal = (ly == lyc);
+
+    if (equal) {
+        *stat |= (1 << 2); // Set coincidence flag
+
+        if (!wasEqual && (*stat & (1 << 6))) {
+            *if_reg |= 0x02; // Request STAT interrupt (bit 1)
+            printf("LYC STAT interrupt requested at line %d, LYC: %d, STAT: 0x%02X, if_reg: 0x%02X\n", ly, lyc, *stat, *if_reg);
+        }
+    } else {
+        *stat &= ~(1 << 2); // Clear coincidence flag
+    }
+
+    wasEqual = equal;
+}
 
 int div_counter = 0;
 int tima_counter = 0;
 
+int windowOnLine = 0; //flag so internal window line counter doesn't increment more than once per line
+
+
 int main(){
     SDL_Init(SDL_INIT_VIDEO);
-    SDL_Window *window = SDL_CreateWindow("GB-EMU", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 720, 0); //window width and height 160x144
-    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED); //default driver gpu accelerated if possible
-    memset(display, 0, sizeof(display));
-    SDL_Window *tileWindow = SDL_CreateWindow(
-    "Tile Viewer", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-    128, 192, 0); // 16 tiles * 8 = 128, 24 tiles * 8 = 192
+    if (TTF_Init() < 0) {
+    printf("Failed to initialize SDL_ttf: %s\n", TTF_GetError());
+    return 1;
+}
 
     logFile = fopen("emu_log.txt", "w");
     if (!logFile) {
@@ -5742,52 +3473,69 @@ int main(){
         exit(1);
     }
 
+    SDL_Window *window = SDL_CreateWindow("GB-EMU", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 800, 720, 0); //window width and height 160x144
+    SDL_Renderer *renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED); //default driver gpu accelerated if possible
+    memset(display, 0, sizeof(display));
+    
+    /*
+    SDL_Window *tileWindow = SDL_CreateWindow(
+    "Tile Viewer", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
+    128, 192, 0); // 16 tiles * 8 = 128, 24 tiles * 8 = 192
+
+    SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACCELERATED);
+    */
+
+    /*
+
+SDL_Window *debugWindow = SDL_CreateWindow(
+    "Debug Panel",
+    SDL_WINDOWPOS_CENTERED + 400, SDL_WINDOWPOS_CENTERED,
+    300, 500,  // Width, Height
+    SDL_WINDOW_SHOWN
+);
+
+SDL_Renderer *debugRenderer = SDL_CreateRenderer(debugWindow, -1, SDL_RENDERER_ACCELERATED);
+
+// Load font
+TTF_Font *debugFont = TTF_OpenFont("arial.ttf", 14);
+if (!debugFont) {
+    printf("Failed to load font: %s\n", TTF_GetError());
+    return 1;
+}
+
 SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACCELERATED);
+*/
 
     loadrom("Tetris.gb"); //initialises  memory and CPU registers in this function as well
     printromHeader();
-    printf("Press Enter to exit...\n");
+    printf("Press Enter to start...\n");
     getchar();
 
     PPU ppu = { //initialise ppu
     .mode = memoryMap[0xFF41], // Mode bits are in STAT
     .ly = memoryMap[0xFF44],   // LY
     .lyc = memoryMap[0xFF45],  // LYC
-    .dotCounter = 0,
-    .frameReady = 0
 };
 
-    fetchStage fetchStage = {
-        .objectFetchStage = 0,
-        .BGFetchStage = 0,
-        .windowFetchMode = 0 //starting from 0 means initialise fetch mode for window and clear BGFifo, and fetcher stages
-    };
-    Queue BGFifo = {
-        .count = 0
-    };
-    Queue SpriteFifo = {
-        .count = 0
-    };
-    
-    int scanlineTimer = 0; // amount of cycles for scanline
-    int mode0Timer = 0; // amount of cycles for Hblank
-    int mode1Timer = 0; // amount of cycles for Vblank
-    int mode2Timer = 0;
-    int mode3Timer = 0; // amount of cycles needed to start next operation
 
-    int xPos = 0;
+    
+
     Sprite spriteBuffer[10]; 
 
     cyclesAccumulated = 0;
-    int CPUtimer = 0; //timer for CPU cycles
+    uint16_t haltPC; //for halt bug
 
     int open = 1;
     SDL_Event event;
+    int overflowFlag = -1;
+    uint8_t serialByte;
+    int serialCounter = 0;
+    int serialInProgress = 0; // Flag to indicate if serial transfer is in progress
+    int spriteCount = 0;
 
-    int DMAFlag = 0; // DMA transfer flag
     
     //Uint32 lastTick = SDL_GetTicks(); //timing
-    int FF85Flag = 0; // Flag for FF85 register
+
 
 
     while (open) {
@@ -5799,188 +3547,154 @@ SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACC
         lastTick = now;
         */
 
-        while (SDL_PollEvent(&event)) { //Check if user quit or not
-            if (event.type == SDL_QUIT) open = 0; //SDL_QUIT is close window button
-            handleButtonPress(&event); //handle button press events
-            //*memoryMap[0xFF00] = readJoypad(*memoryMap[0xFF00]); //read joypad state and write to memory
-        }
-        updateJoypadRegister();
-
-    if (CPUreg.IME && (*memoryMap[0xFFFF] & *memoryMap[0xFF0F])) { // Check if interrupts are enabled and any interrupt is requested
-        handleInterrupts();
-    }
-
-    //DMA
-
-    
-        if ((*memoryMap[0xFF46] != 0xFF) && (DMAFlag == 0)) { // DMA transfer requested
-            DMAFlag = 1;
-            uint8_t dmaSource = *memoryMap[0xFF46]; // Get DMA source address
-            uint16_t sourceAddr = dmaSource << 8; // Convert to 16-bit address
-            uint16_t destAddr = 0xFE00; // OAM starts at 0xFE00
-            for (int i = 0; i < 0xA0; i++) { // Transfer 160 bytes (40 sprites * 4 bytes each)
-                *memoryMap[destAddr + i] = *memoryMap[sourceAddr + i];
-            }
-            *memoryMap[0xFF46] = 0xFF; // Reset DMA register
-            DMAFlag = 0;
-            //getchar(); // Wait for user input to continue
-            //fprintf(logFile, "DMA transfer completed from %02X to OAM\n", dmaSource);
-            //printf("DMA transfer completed from %02X to OAM\n", dmaSource);
-            //cyclesAccumulated += 640; // DMA timing delay
-        }
-
-
-            
-
-        uint16_t oldSP = CPUreg.SP;
-
-            // --- HALT and HALT bug handling ---
-        uint8_t opcode = *memoryMap[CPUreg.PC];
         
-        
-        uint8_t prevFF00 = *memoryMap[0xFF00]; // Save previous FF00 value 
-
-        /*
-        for (uint16_t addr = 0x0000; addr <= 0x3FFF; addr++) {
-            if (*memoryMap[addr] == 0x0A) {
-                //printf("Found 0x0A at address: 0x%04X\n", addr);
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) {
+                saveSRAM("Tetris");
+                printf("Exiting emulator...\n");
+                getchar();
+                open = 0; //close emulator loop and exit
                 break;
             }
-            else{
-                memset(eram,0xFF,sizeof(eram));
-            }
-        }
-            */
 
-            
+            if (event.type == SDL_KEYDOWN) {
+                switch (event.key.keysym.sym) {
+                    case SDLK_SPACE: // Toggle pause
+                        isPaused = !isPaused;
+                        break;
+                    case SDLK_n: // Step through instruction
+                        if (isPaused) stepMode = 1;
+                        break;
+                }
+            }
+
+            handleButtonPress(&event);
+        }
+        
+
+
+    if (!isPaused || stepMode) { //main loop in here to allow pause/step
+
+
+        if(CBFlag != 1){ //make sure interrupt not called before CB instruction finishes execution
+            handleInterrupts();
+        }
+        
+
+        //uint16_t oldSP = CPUreg.SP;
+
+            // --- HALT and HALT bug handling ---
+        
+        uint8_t opcode = *memoryMap[CPUreg.PC];
+
+
+        //uint8_t prevFFCC = *memoryMap[0xFFCC]; // Save previous value of FF E1
+
+        if (CPUtimer > 0) {
+            CPUtimer--;
+        }
         if (CPUtimer == 0){
-            if (opcode == 0xC3 || opcode == 0xCD || opcode == 0xC9) {  // JP, CALL, RET
-    //fprintf(logFile,"Jump/Call/Return at PC=%04X, opcode=%02X, target depends on next byte(s)\n", CPUreg.PC, opcode);
-}           
+            //fprintf(logFile, "PC: %04X, Opcode: %02X, Cycles: %d, SP: %04X, A: %02X, B: %02X, C: %02X, D: %02X, E: %02X, F: %02X, H: %02X, L: %02X, LY: %02X, LYC: %02X, FF80: %02X, FF85: %02X, FF00: %02X, FFFF: %02X, FF0F: %02X, FF40: %02X, FF41: %02X, FF44: %02X, FF45: %02X\n", CPUreg.PC, opcode, realCyclesAccumulated, CPUreg.SP, CPUreg.af.A, CPUreg.bc.B, CPUreg.bc.C, CPUreg.de.D, CPUreg.de.E, CPUreg.af.F, CPUreg.hl.H, CPUreg.hl.L, *(ppu.ly), *(ppu.lyc), *memoryMap[0xFF80], *memoryMap[0xFF85], *memoryMap[0xFF00], *memoryMap[0xFFFF], *memoryMap[0xFF0F], *memoryMap[0xFF40], *memoryMap[0xFF41], *memoryMap[0xFF44], *memoryMap[0xFF45]);
+            //fprintf(logFile, "Mode 1 Timer: %d, Mode 0 Timer: %d, Mode 2 Timer: %d, Mode 3 Timer: %d, xPos: %d, scanlineTimer: %d\n", mode1Timer, mode0Timer, mode2Timer, mode3Timer, xPos, scanlineTimer);
+            //halt mode 1 handled in interrupt handler
+            //fprintf(logFile, "Haltmode %d, CPUtimer: %d\n", haltMode, CPUtimer);
 
-            fprintf(logFile, "%04X %02X\n", CPUreg.PC, opcode);
-            //printf("PC: %04X, Opcode: %02X\n", CPUreg.PC, opcode);
-            //fprintf(logFile, "PC: %04X, Opcode: %02X, Cycles: %d, SP: %04X, A: %02X, B: %02X, C: %02X, D: %02X, E: %02X, F: %02X, H: %02X, L: %02X, LY: %02X, LYC: %02X, FF80: %02X, FF85: %02X, FF00: %02X\n", CPUreg.PC, opcode, realCyclesAccumulated, CPUreg.SP, CPUreg.af.A, CPUreg.bc.B, CPUreg.bc.C, CPUreg.de.D, CPUreg.de.E, CPUreg.af.F, CPUreg.hl.H, CPUreg.hl.L, *(ppu.ly), *(ppu.lyc), *memoryMap[0xFF80], *memoryMap[0xFF85], *memoryMap[0xFF00]);
-        }
-        if (haltMode == 1) {
-            uint8_t IE = *memoryMap[0xFFFF];
-            uint8_t IF = *memoryMap[0xFF0F];
+        if(haltMode != 1){ //execute CPU only if haltMode is not 1 (CPU not halted)
 
-            // Wake up if any interrupt is pending
-            if ((IE & IF & 0x1F) != 0) {
-                haltMode = 0;
-            } else {
-                // Don't fetch or execute instructions — but still let system tick
-                // No continue here, just skip execution block below
-            }
-        } else if (haltMode == 2) {
+        if (haltMode == 2) {
             // HALT bug: execute same instruction twice
-            pcBacktrace[backtraceIndex] = CPUreg.PC - 1;
-            backtraceIndex = (backtraceIndex + 1) % 8;
+            //pcBacktrace[backtraceIndex] = CPUreg.PC - 1;
+           // backtraceIndex = (backtraceIndex + 1) % 8;
+            if (EIFlag == 1) EIFlag = -1; //after EI flag set to -1 so interrupt enabled after 1 instruction delay
+            else if (EIFlag == -1 && CBFlag == 0) { 
+                CPUreg.IME = 1;
+                EIFlag = 0;
+            }
+
+            CPUreg.PC--; //set PC back by one so byte is read twice
             executeOpcode(opcode);
+
             CPUtimer = cyclesAccumulated;
             haltMode = 0;
             cyclesAccumulated = 0;
         } else {
             // --- Normal CPU execution ---
-            pcBacktrace[backtraceIndex] = CPUreg.PC - 1;
-            backtraceIndex = (backtraceIndex + 1) % 8;
-            if (CPUtimer > 0) {
-                CPUtimer--;
-            } else {
+           // pcBacktrace[backtraceIndex] = CPUreg.PC - 1;
+            //backtraceIndex = (backtraceIndex + 1) % 8;
+            haltPC = CPUreg.PC; // Store PC for halt bug
                 if (CBFlag == 0) {
-                    //printf("Executing opcode %02X at PC=%04X\n", opcode, CPUreg.PC);
-                    executeOpcode(opcode);
-                    CPUtimer = cyclesAccumulated;
                     if (EIFlag == 1) EIFlag = -1;
-                    else if (EIFlag == -1 || EIFlag == -2) {
+                    else if (EIFlag == -1 && CBFlag == 0) {
                         CPUreg.IME = 1;
                         EIFlag = 0;
                     }
+                    //printf("Executing opcode %02X at PC=%04X\n", opcode, CPUreg.PC);
+                    executeOpcode(opcode);
+                    CPUtimer = cyclesAccumulated;
                 } else {
+                    if (EIFlag == -1){
+                        CPUreg.IME = 1;
+                        EIFlag = 0;
+                    } 
                     executeOpcodeCB(opcode);
                     //printf("Executing opcode %02X at PC=%04X\n", opcode, CPUreg.PC);
                     CPUtimer = cyclesAccumulated;
                     CBFlag = 0;
-                    if (EIFlag == -1) EIFlag = -2;
                 }
+
                 cyclesAccumulated = 0;
+                
             }
         }
-        *memoryMap[0xFF00] = (*memoryMap[0xFF00] & 0xF0) | (prevFF00 & 0x0F); //preserve lower bits
+    }
+
+   
+
+    /*
 
         if (CPUreg.SP != oldSP && debug == 1) {
             printf("[SP CHANGE] from %04X → %04X at PC=%04X\n", oldSP, CPUreg.SP, CPUreg.PC);
             oldSP = CPUreg.SP;
         }
 
-    //CPU
-    /*
-    uint8_t opcode = *memoryMap[CPUreg.PC]; //fetch opcode from memory at PC address 
-    
-    //PC incremented in opcodes functions
-    //printf("Before Cycles accumulated: %d\n", realCyclesAccumulated);
-    //printf("F flags: Z=%d N=%d H=%d C=%d\n", getZeroFlag(), getSubtractFlag(), getHalfCarryFlag(), getCarryFlag());
-    //printf("Before PC: %04X, OP: %02X, B: %02X, F: %02X\n", CPUreg.PC, opcode, CPUreg.bc.B, CPUreg.af.F);
-
-    if (CPUtimer > 0) { //if CPU timer is greater than 0, then we are still in the middle of executing an opcode
-        CPUtimer--;
-    }
-    else {
-        if (CBFlag == 0) {
-            executeOpcode(opcode); //execute the op code once last opcode is done (cycle count for previous opcode is done)
-            CPUtimer = cyclesAccumulated; //potentuially just change cyclesAccumulated to CPUtimer later in code
-        
-            if (EIFlag == 1){ // EIflag to cause 1 instruction delay after EI opcode
-                EIFlag = -1; // reset EIFlag to -1 after executing EI opcode
-            }
-            else if (EIFlag == -1) { // after 1 instruction delay, set IME to 1 and reset EIFlag
-                CPUreg.IME = 1;
-                EIFlag = 0; // reset after executing EI opcode
-            }
-            else if (EIFlag == -2) { // after 1 instruction delay, set IME to 1 and reset EIFlag
-                CPUreg.IME = 1;
-                EIFlag = 0; // reset after executing EI opcode
-            }
+    uint8_t afterFFCC = *memoryMap[0xFFCC];
+    if (afterFFCC != prevFFCC) {
+        if (1) {
+            printf("[FF CC CHANGE] from %02X → %02X at PC=%04X, OPCode: %02X\n", prevFFCC, afterFFCC, CPUreg.PC, opcode);
         }
-        else { //CBFlag is set, execute CB opcode
-            executeOpcodeCB(opcode);
-            CPUtimer = cyclesAccumulated; //set CPU timer to cycles accumulated
-            CBFlag = 0; //reset CBFlag after executing CB opcode
-            if (EIFlag == -1) { // after 1 instruction delay, set IME to 1 and reset EIFlag
-                EIFlag = -2; // reset after executing EI opcode
-                CBFlag = 0;
-            }
-        }
-        cyclesAccumulated = 0;
-
     }
-    */
-
-    //printf(" After PC: %04X, OP: %02X, B: %02X, F: %02X\n", CPUreg.PC, opcode, CPUreg.bc.B, CPUreg.af.F);
-    //printf("F flags: Z=%d N=%d H=%d C=%d\n",getZeroFlag(), getSubtractFlag(), getHalfCarryFlag(), getCarryFlag());
-    //printf("After Cycles accumulated: %d\n OPCode: %d \n PC: %d\n", realCyclesAccumulated, opcode, CPUreg.PC);
-    //printf("input: %02X\n ppu mode: %02X\n BGFetchStage: %02X\n", *memoryMap[0xFF00], *ppu.mode, fetchStage.BGFetchStage); //print input state
-    //getchar(); //wait for user input to continue, remove later
+        */
 
     //PPU 
-
+    if (LCDdelayflag == 0 && LCDdisabled == 1) { 
+        *memoryMap[0xFF41] = (*memoryMap[0xFF41] & ~0x03) | 0x02; // Set mode to 2 (OAM)
+        LCDdisabled = 0; // Reset LCD disabled flag
+        //fprintf(logFile, "LCDC enabled, cycle: %ld\n", realCyclesAccumulated);
+    }
+        
     switch(*ppu.mode & 0x03){ //get which mode the PPU is currently in
-        case(0):
+        case(0): //HBlank
             mode0Timer = 456 - scanlineTimer; //HBlank lasts 456 cycles, subtract the cycles already used in this scanline
             //printf("Mode 0: HBlank, Timer: %d\n", mode0Timer);
             if (mode0Timer == 0) { //if timer is 0, then
-                if (*ppu.ly == 144) { //Start VBlank 
+                if (*ppu.ly == 143) { //Start VBlank 
+                    (*ppu.ly)++;
+                    checkLYC(memoryMap);
                     drawDisplay(renderer); //draw display to window 
-                    drawTileViewer(tileRenderer);
+                    //drawTileViewer(tileRenderer);
                     SDL_RenderPresent(renderer); //update window with everything drawn
+                   // drawDebugWindow(debugRenderer, debugFont); //draw debug window
+
                     *memoryMap[0xFF0F] |= 0x01; // Set VBlank flag in IF register
+
                     //printf("VBlank request at cycle %d\n", realCyclesAccumulated);
                     if (debug == 1) {
-                        printf("VBlank started at cycle %d\n", realCyclesAccumulated);
+                        //printf("VBlank started at cycle %d\n", realCyclesAccumulated);
                     }
+
                     // Enter VBlank mode
-                    *ppu.mode = (*ppu.mode & 0xFC) | 0x01; // Mode 1
+                    *ppu.mode = (*ppu.mode & ~0x03) | 0x01;
+                    //*ppu.mode = (*ppu.mode & 0xFC) | 0x01; // Mode 1
                     if (*memoryMap[0xFF41] & 0x10) { // Bit 4: VBlank STAT interrupt enable
                         *memoryMap[0xFF0F] |= 0x02;  // STAT interrupt request flag
                     }
@@ -5989,38 +3703,25 @@ SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACC
                     scanlineTimer = 0; //reset scanline timer
                 }
                 else{   
-                    *ppu.mode = (*ppu.mode & 0xFC) | (2 & 0x03); //set mode to OAM scan
+                    (*ppu.ly)++;
+                    checkLYC(memoryMap); //increment LY and check LYC register for coincidence with LY
+                    //*ppu.mode = (*ppu.mode & 0xFC) | (2 & 0x03); //set mode to OAM scan
+                    *ppu.mode = (*ppu.mode & ~0x03) | 0x02; // Set to Mode 2 (OAM scan)
                     if (*memoryMap[0xFF41] & 0x20) { // Bit 5: OAM STAT interrupt enable
                         *memoryMap[0xFF0F] |= 0x02;  // STAT interrupt request flag
                     }
                     scanlineTimer = 0; //reset scanline timer
                 }
+            windowOnLine = 0; //reset internal window line counter flag for that scanline, so doesn't increment multiple time per line
             }
             break;
 
-        case(1):
-            if (*memoryMap[0xFF44] == *memoryMap[0xFF45]) { // Check LYC register for coincidence
-                        *memoryMap[0xFF41] |= 0x04; // Set coincidence flag (bit 2)
-                        if (*memoryMap[0xFF41] & 0x40) { // If coincidence interrupt is enabled
-                            *memoryMap[0xFF0F] |= 0x02; // Request STAT interrupt (bit 1 of IF)
-                        }
-                    } else {
-                        *memoryMap[0xFF41] &= ~0x04; // Clear coincidence flag
-                    }
-            if(*ppu.ly != 153){
+        case(1): // VBlank
+            if(*ppu.ly != 153 && *ppu.ly != 0){
                 if(mode1Timer == 0){
                     (*ppu.ly)++; // increment LY 
                     //printf("Scanline %d\n", *ppu.ly);
-                    if (*ppu.ly == *ppu.lyc) { // Check LYC register for coincidence
-                        *memoryMap[0xFF41] |= 0x04; // Set coincidence flag (bit 2)
-
-                    if (*memoryMap[0xFF41] & 0x40) { // If coincidence interrupt is enabled
-                        *memoryMap[0xFF0F] |= 0x02; // Request STAT interrupt (bit 1 of IF)
-                    }
-                    } 
-                    else {
-                        *memoryMap[0xFF41] &= ~0x04; // Clear coincidence flag
-                    }
+                    checkLYC(memoryMap);
 
                     mode1Timer = 456; // VBlank lasts 10 lines of 456 cycles each
                     scanlineTimer = 0; //reset scanline timer
@@ -6031,21 +3732,17 @@ SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACC
                 }
             }
             else{ //LY is 153, last VBLANK line
-                if(mode1Timer == 0){
-                    *ppu.ly = 0; // reset LY to 0
+                if(mode1Timer == 448){ 
+                    *ppu.ly = 0; //line 153 quirk, after 8 cycles ly is set to 0, then continue rest of cycles to end of vblank
+                    checkLYC(memoryMap);
+                    mode1Timer--; //decrement mode1Timer until it reaches 0
+                }
+                else if(mode1Timer == 0){ 
                     scanlineTimer = 0; //reset scanline timer
-                    if (*ppu.ly == *ppu.lyc) { // Check LYC register for coincidence
-                        *memoryMap[0xFF41] |= 0x04; // Set coincidence flag (bit 2)
-
-                    if (*memoryMap[0xFF41] & 0x40) { // If coincidence interrupt is enabled
-                        *memoryMap[0xFF0F] |= 0x02; // Request STAT interrupt (bit 1 of IF)
-                    }
-                    } 
-                    else {
-                        *memoryMap[0xFF41] &= ~0x04; // Clear coincidence flag
-                    }
-                    *ppu.mode = (*ppu.mode & 0xFC) | (2 & 0x03); // set mode to OAM scan
+                    //*ppu.mode = (*ppu.mode & 0xFC) | (2 & 0x03); // set mode to OAM scan
+                    *ppu.mode = (*ppu.mode & ~0x03) | 0x02; // Set to Mode 2 (OAM scan)
                     mode1Timer = 456; // reset timer for next VBlank
+                    windowLine = 0; // reset internal window line counter
                 }
 
                 else {
@@ -6056,146 +3753,213 @@ SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACC
 
         //OAM scan, wait 80 cycles then load the spriteBuffer and change to mode 3
 
-        case(2): 
+        case(2):  // OAM Scan
             if(mode2Timer != 80){
                 mode2Timer++; //wait 80 cycles before switching modes
             }
             else if(mode2Timer == 80){
-                spriteSearchOAM(*memoryMap[0xFF44], spriteBuffer); //store sprites in sprite buffer
+                spriteCount = spriteSearchOAM(*memoryMap[0xFF44], spriteBuffer); //store sprites in sprite buffer and no. of sprites
                 mode2Timer = 0; //reset timer for next mode 2 check
-                *memoryMap[0xFF41] = (*memoryMap[0xFF41] & 0xFC) | (3 & 0x03); //set to mode 3
+                //*memoryMap[0xFF41] = (*memoryMap[0xFF41] & 0xFC) | (3 & 0x03); //set to mode 3
+                *memoryMap[0xFF41] = (*memoryMap[0xFF41] & ~0x03) | 0x03;
             }
             break;
 
         //Mode 3 fetching and pushing queues, change to HBlank after scanline done, Vblank when all scanlines done
 
-        case(3): //Currently the BG / Window fetcher  no sprite
+        case(3):  // BG/Window fetcher (with sprite mix)
             uint8_t lcdc = *memoryMap[0xFF40];
-            uint8_t wx = *memoryMap[0xFF4B];
+            uint8_t wx   = *memoryMap[0xFF4B];
+            uint8_t wy   = *memoryMap[0xFF4A];
+            uint8_t scx  = *memoryMap[0xFF43];
+
             int windowEnabled = (lcdc & 0x20) != 0;
-            int windowStartX = wx - 7;
-            uint8_t wy = *memoryMap[0xFF4A];
+            int windowStartX  = (int)wx - 7;
 
-            if (windowEnabled && xPos >= windowStartX && fetchStage.windowFetchMode == 0 && *ppu.ly == wy) { //if window is enabled for first time, clear queue and fetch windows
+            // Window is *actually* visible at this pixel?
+            int windowVisibleNow =
+                windowEnabled &&
+                (*ppu.ly >= wy) &&          // window starts at WY and continues downward
+                (xPos >= windowStartX);     // and only after WX-7 horizontally
+
+            // One-time switch from BG -> Window when it first becomes visible this scanline
+            if (!fetchStage.windowFetchMode && windowVisibleNow) {
+                // flush any queued BG pixels so the window starts cleanly
                 for (int i = 0; i < 8; i++) {
-                    Pixel temp;
-                    dequeue(&BGFifo, &temp);
+                    Pixel tmp;
+                    dequeue(&BGFifo, &tmp);
                 }
-                fetchStage.BGFetchStage = 0;
-                mode3Timer = 2;
-                fetchStage.windowFetchMode = 1; 
-            } 
-            else if(windowEnabled && fetchStage.windowFetchMode == 1 && mode3Timer == 0){ //fetching window tiles 
-                if(fetchStage.BGFetchStage == 0){
-                    fetchStage.BGFetchStage = 1;
-                    mode3Timer = 2;
-                }
-                else if(fetchStage.BGFetchStage == 1){
-                    fetchStage.BGFetchStage = 2;
-                    mode3Timer = 2;
-                }
-                else if(fetchStage.BGFetchStage == 2){
-                    fetchStage.BGFetchStage = 3;
-                    mode3Timer = 2;
-                }
-                else if (fetchStage.BGFetchStage == 3){ //window xPos - (wx-7) handled in function for window mode
-                    pixelPushBG(&BGFifo, xPos, &fetchStage, 1); //sets BGfetchStage to 0 if success otherwise stays on 3
-                    mode3Timer = 2;
-                }
-            }
-            else if (windowEnabled == 0 && fetchStage.windowFetchMode == 1){ // window turned off and back to background mode?
-                for (int i = 0; i < 8; i++) {
-                    Pixel temp;
-                    dequeue(&BGFifo, &temp);
-                }
-                fetchStage.BGFetchStage = 0;
-                fetchStage.windowFetchMode = 0;
-                mode3Timer = 2;
-            }
-            else if (windowEnabled == 0 && fetchStage.windowFetchMode == 0 && fetchStage.BGFetchStage == 0 && mode3Timer == 0){
-                fetchStage.BGFetchStage = 1; //start fetching background tiles
-                mode3Timer = 2;
-            }     
-            else if (windowEnabled == 0 && fetchStage.windowFetchMode == 0 && fetchStage.BGFetchStage == 1 && mode3Timer == 0 ){
-                fetchStage.BGFetchStage = 2;
-                mode3Timer = 2;
-            }
-            else if (windowEnabled == 0 && fetchStage.windowFetchMode == 0 && fetchStage.BGFetchStage == 2 && mode3Timer == 0 ){
-                fetchStage.BGFetchStage = 3;
-                mode3Timer = 2;
-            }
-            else if (windowEnabled == 0 && fetchStage.windowFetchMode == 0 && fetchStage.BGFetchStage == 3 && mode3Timer == 0 ){
-                //switches to mode 0 in bgpush function if needed
-                pixelPushBG(&BGFifo, xPos , &fetchStage, 0); //pixel push for background (0) mode not window mode, scx handled by discarding later on
-                //getchar(); //wait for user input to continue, remove later
+                fetchStage.BGFetchStage    = 0;
+                fetchStage.windowFetchMode = 1;
                 mode3Timer = 2;
             }
 
-            //FIFO pixel pushing to screen mode 3
-            //scxCounter = 0, newScanLine = 1, set outside main loop
+            // Advance the correct pipeline when ready
+            if (fetchStage.windowFetchMode) {
+                // If window got disabled mid-line, drop back to BG cleanly
+                if (!windowEnabled) {
+                    for (int i = 0; i < 8; i++) {
+                        Pixel tmp;
+                        dequeue(&BGFifo, &tmp);
+                    }
+                    fetchStage.BGFetchStage    = 0;
+                    fetchStage.windowFetchMode = 0;
+                    mode3Timer = 2;
+                } else if (mode3Timer == 0) {
+                    // Window pipeline stages
+                    if      (fetchStage.BGFetchStage == 0) { fetchStage.BGFetchStage = 1; mode3Timer = 2; }
+                    else if (fetchStage.BGFetchStage == 1) { fetchStage.BGFetchStage = 2; mode3Timer = 2; }
+                    else if (fetchStage.BGFetchStage == 2) { fetchStage.BGFetchStage = 3; mode3Timer = 2; }
+                    else /* BGFetchStage == 3 */ {
+                        // xPos - (wx-7) handled inside pixelPush for window mode
+                        pixelPushBG(&BGFifo, xPos, &fetchStage, /*windowMode=*/1);
+                        mode3Timer = 2;
+                    }
+                }
+            } else {
+                // Background pipeline (runs even if windowEnabled=1 but not yet visible)
+                if (mode3Timer == 0) {
+                    if      (fetchStage.BGFetchStage == 0) { fetchStage.BGFetchStage = 1; mode3Timer = 2; }
+                    else if (fetchStage.BGFetchStage == 1) { fetchStage.BGFetchStage = 2; mode3Timer = 2; }
+                    else if (fetchStage.BGFetchStage == 2) { fetchStage.BGFetchStage = 3; mode3Timer = 2; }
+                    else /* BGFetchStage == 3 */ {
+                        // BG push (SCX handled by discarding below)
+                        pixelPushBG(&BGFifo, xPos, &fetchStage, /*windowMode=*/0);
+                        mode3Timer = 2;
+                    }
+                }
+            }
 
-            uint8_t scx = *memoryMap[0xFF43];
-            if(xPos == 0 && newScanLine){ //set counter for pixels to discard because of scroll on this scanline
-                scxCounter = scx % 8;
+            // Set discard count once per new scanline
+            //Need to add 8 pixel discard
+            if (xPos == 0 && newScanLine) {
+                scxCounter = scx & 7; //lower 3 bits of scx for fine scroll, and with 0b0111
                 newScanLine = 0;
             }
 
+            // FIFO -> screen (sprite mixing preserved)
             if (BGFifo.count > 0) {
-                if(scxCounter > 0){  //don't do anything with pixel, discard x bits for scroll
+                if (scxCounter > 0) {
                     Pixel discard;
                     dequeue(&BGFifo, &discard);
                     scxCounter--;
-                }
-                else{
+                } else {
                     Pixel pixelToPush;
                     dequeue(&BGFifo, &pixelToPush);
-                    // do pixel mixing etc here
-                    // Send to display buffer...
+
                     int y = *ppu.ly;
-                    if (y < 144) {
-                        display[xPos][y] = pixelToPush.colour;
-                        //printf("Draw: (%d, %d) = %d\n", xPos, y, pixelToPush.colour);
+
+                    uint8_t finalColour = 0;  
+                    if (lcdc & 0x01) { //if BG/Window enable bit is 0 then send pixel of colour 0
+                        finalColour = pixelToPush.colour;
                     }
 
-                    xPos++; // increment xPos here
-                }
-                
-            } //need spritemixing etc but this would be the pixel added to display buffer for that scanline/xPos
-            if (xPos >= 160) {
-                *ppu.mode = (*ppu.mode & 0xFC) | 0x00; // Mode 0 (HBlank)
-                if (*memoryMap[0xFF41] & 0x08) { // Bit 3: HBlank STAT interrupt enable
-                    *memoryMap[0xFF0F] |= 0x02;  // Set STAT interrupt request flag (bit 1)
-                }
-                xPos = 0; //reset xPos for next line
-                fetchStage.BGFetchStage = 0;
-                //update LY or VBLANK, VBLANK is hanndledd in HBlank
-                (*ppu.ly)++;
-                //printf("Scanline %d completed, moving to next line\n", *ppu.ly);
+                    // --- sprite mixing (unchanged logic) ---
+                    if (lcdc & 0x02) { //if sprite bit is enabled
+                        for (int i = 0; i < spriteCount; i++) {
+                            Sprite *spr = &spriteBuffer[i];
+                            if (spr->xPos == 0 || spr->xPos >= 168) continue;
 
-                if (*ppu.ly == *ppu.lyc) { // Check LYC register for coincidence
-                    *memoryMap[0xFF41] |= 0x04; // Set coincidence flag (bit 2)
-                    if (*memoryMap[0xFF41] & 0x40) { // If coincidence interrupt is enabled
-                        *memoryMap[0xFF0F] |= 0x02; // Request STAT interrupt (bit 1 of IF)
+                            int spriteX = spr->xPos - 8;
+                            int spriteY = spr->yPos - 16;
+                            int spriteHeight = (*memoryMap[0xFF40] & 0x04) ? 16 : 8;
+
+                            if (xPos >= spriteX && xPos < spriteX + 8 &&
+                                y   >= spriteY && y   < spriteY + spriteHeight) {
+
+                                int tileLine = y - spriteY;
+                                if (spr->flags & 0x40) tileLine = spriteHeight - 1 - tileLine; // Y flip
+
+                                uint16_t tileNum = spr->tileNum;
+                                if (spriteHeight == 16) tileNum &= 0xFE;
+
+                                uint16_t tileAddr = 0x8000 + tileNum * 16 + tileLine * 2;
+                                uint8_t byte1 = *memoryMap[tileAddr];
+                                uint8_t byte2 = *memoryMap[tileAddr + 1];
+
+                                int bit = (spr->flags & 0x20) ? (xPos - spriteX) : (7 - (xPos - spriteX)); // X flip
+                                int colorId = ((byte2 >> bit) & 1) << 1 | ((byte1 >> bit) & 1);
+                                if (colorId != 0) {
+                                    uint8_t palette = (spr->flags & 0x10) ? *memoryMap[0xFF49] : *memoryMap[0xFF48];
+                                    uint8_t spriteColour = (palette >> (colorId * 2)) & 0x03;
+                                    if (pixelToPush.colour == 0 || !(spr->flags & 0x80)) {
+                                        finalColour = spriteColour;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
                     }
-                } else {
-                    *memoryMap[0xFF41] &= ~0x04; // Clear coincidence flag
-                }
 
-                newScanLine = 1;  //reset newScanLine for next loop
+                    if (y < 144) display[xPos][y] = finalColour;
+                    xPos++;
+                }
             }
+
+            // End of visible scanline -> HBlank
+            if (xPos >= 160) {
+                *ppu.mode = (*ppu.mode & ~0x03) | 0x00; // Mode 0 (HBlank)
+                if (*memoryMap[0xFF41] & 0x08) *memoryMap[0xFF0F] |= 0x02; // STAT HBlank
+                xPos = 0;
+                while (BGFifo.count > 0) { //clear FIFO for next scanline
+                    Pixel tmp; 
+                    dequeue(&BGFifo, &tmp);
+                }
+                fetchStage.BGFetchStage = 0;
+                newScanLine = 1;
+                fetchStage.windowFetchMode = 0; //reset window fetch mode for next scanline
+                // LY advance handled in HBlank
+                if (windowVisibleNow && windowOnLine == 0) { //make sure windowLine only increments once per scanline if window is on it
+                    windowLine++;
+                    windowOnLine = 1;
+                }
+            } 
+
+            
             break;
         }
+                
 
     //SDL_Delay(1000/63); //fps
-    mode3Timer--; //decrement mode3Timer for next loop, if 0 then fetch next pixel
-    realCyclesAccumulated += 1; //increment real cycles accumulated for each loop
-    scanlineTimer += 1; //increment scanline timer for each loop
-    if (mode3Timer <= 0) {
-        mode3Timer = 0; //reset mode3Timer for next loop
+    if (LCDdisabled == 0) { //if LCD is enabled, then continue with PPU
+        mode3Timer--; //decrement mode3Timer for next loop, if 0 then fetch next pixel
+        scanlineTimer += 1; //increment scanline timer for each loop
+        if (mode3Timer <= 0) {
+            mode3Timer = 0; //reset mode3Timer for next loop
+        }
     }
+    realCyclesAccumulated += 1; //increment real cycles accumulated for each loop
+    LCDdelayflag--;
+    checkLYC(memoryMap); // Check LYC register for coincidence with LY regardless of LCD state
+//fprintf(logFile, "xPos: %02X, LY: %02X, scx: %02X,BGFetchStage: %d, windowFetchMode %d, wy %02X, wx %02X, LCDC: %02X, BGFifoCount: %d \n  ", xPos, *memoryMap[0xFF44], *memoryMap[0xFF43], fetchStage.BGFetchStage, fetchStage.windowFetchMode, *memoryMap[0xFF4A], *memoryMap[0xFF4B], *memoryMap[0xFF40], BGFifo.count);
 
     //Serial communication
 
+if (!serialInProgress && (*memoryMap[0xFF02] & 0x80)) {
+    // Start transfer
+    serialInProgress = 1;
+    serialCounter = 1024;
+    serialByte = *memoryMap[0xFF01];
+}
+
+if (serialInProgress) {
+    serialCounter--;
+    //*memoryMap[0xFF02] |= 0x80; // Set SC bit to indicate transfer in progress
+    if (serialCounter == 0) {
+        // Transfer complete
+        *memoryMap[0xFF01] = 0xFF;   // echo back
+        *memoryMap[0xFF02] &= ~0x80;       // clear SC
+        //*memoryMap[0xFF0F] |= 0x08;        // request serial interrupt
+        //don't request interrupt since no link cable support yet in this emulator
+        printf("%c", serialByte);          // optional
+        fflush(stdout);
+        serialInProgress = 0;
+    }
+}
+
+//fprintf(logFile,"FF02: %02X, FF01: %02X, Serial In Progress: %d\n", *memoryMap[0xFF02], *memoryMap[0xFF01], serialInProgress);
+
+    /*
     if (*memoryMap[0xFF02] & 0x80) { // Transfer requested
         // Print the byte being "sent" over serial
         printf("%c", *memoryMap[0xFF01]);
@@ -6206,9 +3970,11 @@ SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACC
         *memoryMap[0xFF02] &= ~0x80; // Clear transfer bit
         *memoryMap[0xFF0F] |= 0x08;  // Request serial interrupt
     }
+        */
 
     // Timer handling
 
+    /*
     div_counter++;
     if (div_counter >= 256) { // DIV increments every 256 cycles
         (*memoryMap[0xFF04])++;
@@ -6228,176 +3994,74 @@ SDL_Renderer *tileRenderer = SDL_CreateRenderer(tileWindow, -1, SDL_RENDERER_ACC
         if (tima_counter >= freq) {
             tima_counter = 0;
             if (++(*memoryMap[0xFF05]) == 0) { // TIMA overflow
-                *memoryMap[0xFF05] = *memoryMap[0xFF06]; // Load TMA
-                *memoryMap[0xFF0F] |= 0x04; // Request timer interrupt
+                overflowFlag = 4;
             }
         }
     }
-    //printQueueState("BGFifo", &BGFifo);
-    //printQueueState("SpriteFifo", &SpriteFifo);
-    //printf("Mode 0: Scanlne, Timer: %d\n", scanlineTimer);
-    //printf("ly: %d, xPos: %d\n", *ppu.ly, xPos);
-    //printf("PC: %04X, OP: %02X\n", CPUreg.PC, *memoryMap[CPUreg.PC]);
 
-    
+    if (overflowFlag == 0) {
+        *memoryMap[0xFF05] = *memoryMap[0xFF06]; // Load TMA
+        *memoryMap[0xFF0F] |= 0x04; // Request timer interrupt
+        overflowFlag = -1; //reset flag to cause 1 cycle delay on overflow
     }
+    else if (overflowFlag > 0) {
+        overflowFlag--;
+    }
+        */
+
+    // 16-bit internal DIV counter, old timer based counter inaccurate due to DIV counter value not starting at 0 when changing frequency
+    //so changed to rising edge detection of DIV bits like actual hardware
+    
+    static uint16_t divInternal = 0;
+    static uint16_t prev_div = 0;
+
+    divInternal++; // increment by 1 CPU cycle
+    *memoryMap[0xFF04] = divInternal >> 8; // upper 8 bits visible as DIV
+
+    uint8_t tac = *memoryMap[0xFF07];
+    if (tac & 0x04) { // Timer enabled
+        // Which DIV bit triggers TIMA, not actually done by cycles elapsed but monitoring DIV bits
+        const uint8_t timerBit[4] = {9, 3, 5, 7};
+        uint16_t mask = 1 << timerBit[tac & 0x03];
+
+        // Check for rising edge of the relevant DIV bit
+        if ((prev_div & mask) != 0 && (divInternal & mask) == 0) { //check if relevant bit changed from 1 to 0 (falling edge)
+            if (++(*memoryMap[0xFF05]) == 0) { // TIMA overflow
+                overflowFlag = 4; // 4 CPU cycles delay for TIMA reload
+            }
+        }
+    }
+    prev_div = divInternal;
+
+    // Handle TIMA reload and interrupt
+    if (overflowFlag > 0) {
+        overflowFlag--; 
+        *memoryMap[0xFF05] = 0; // keep TIMA at 0 for 4 cycle period
+        if (overflowFlag == 0) {
+            *memoryMap[0xFF05] = *memoryMap[0xFF06]; // Reload TIMA from TMA
+            *memoryMap[0xFF0F] |= 0x04;              // Request timer interrupt
+           // printf("Timer interrrupt requested\n");
+        }
+    }
+
+    if (DMAcycles == 0 && DMAFlag == 1) { // If DMA transfer is completed
+        DMAFlag = 0; // Reset DMA flag
+    }
+    else if (DMAcycles > 0) { // If DMA transfer is in progress
+        DMAcycles--;
+    }
+    if (stepMode) stepMode = 0; // Reset after single step, end of pause loop
+
+    //fprintf(logFile,"[PPU DEBUG] realCycles=%d | LY=%d | STAT=0x%02X\n",realCyclesAccumulated, *memoryMap[0xFF44], *memoryMap[0xFF41]);
+    
+}
+    }
+    
 
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
+    TTF_Quit();
     SDL_Quit();
     return 0;
                                   
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*
- void draw_scanline() {
-    uint8_t lcdc = *memoryMap[0xFF40]; //Control flags
-    uint8_t scy = *memoryMap[0xFF42]; //scroll X
-    uint8_t scx = *memoryMap[0xFF43]; //scroll Y
-    uint8_t ly  = *memoryMap[0xFF44]; //Which scanline currently on (0-153)
-    uint8_t bgp = *memoryMap[0xFF47]; //Background palette, controls which colour is shown for each colour value assigned to pixel (0-3)
-
-    // Tile map 32x32 grid containing tile numbers to draw (0–255 or -128 to 127), 2 tile maps, stored in tileMapBase
-   //  tile numbers give actual tile at that position, they are 8x8 using 2 bits per pixel (4 colour) and stored as 16 bytes, using 2 bytes per row
-   //  , tile data stored in tileDataBase using either signed or unsigned numbers
-   //  x9800–0x9BFF → Tile Map 0
-     // 0x9C00–0x9FFF → Tile Map 1
-    // 0x8000–0x8FFF → 256 tiles (unsigned)
-    // 0x8800–0x97FF → 256 tiles (signed, -128 to 127) 
-
-    uint16_t tileMapBase = (lcdc & 0x08) ? 0x9C00 : 0x9800; //bit 3, which tile map to choose 0 or 1, (0 for tile map 0 and 1 for tile map 1 )
-    uint16_t useUnsignedTiles = ((lcdc & 0x10) != 0); //bit 4, whether to use signed or unsigned tiles (0–255 or -128 to 127, 1 is unsigned, 0 is signed) signed and unsigned have different tiles even for same number, don't overlap in memory e.g sig 10 != unsig 10 
-
-     for (int x = 0; x < 160; x++) {
-        uint8_t scrollX = scx; //position on 256 x 256 tile map
-        uint8_t scrollY = scy;
-        uint16_t mapX = (x + scrollX) & 0xFF; //x position on map for current scanline
-        uint16_t mapY = (ly + scrollY) & 0xFF; //scanline + yscroll (Y position on map)
-
-        uint16_t tileRow = mapY / 8;
-        uint16_t tileCol = mapX / 8;
-        uint16_t tileIndexAddr = tileMapBase + tileRow * 32 + tileCol; //get tile number from tilemap
-        int8_t tileNum = *memoryMap[tileIndexAddr]; //number of tile to use for address
-
-        uint16_t tileAddr; //address for tiles depending on signed vs unsigned
-        if (useUnsignedTiles != 0) {
-            tileAddr = 0x8000 + ((uint8_t)tileNum * 16);
-        } else {
-            tileAddr = 0x9000 + (tileNum * 16);
-        }
-
-        uint8_t line = mapY % 8; //which row of the tile, currently at, 0-7
-        uint8_t byte1 = *memoryMap[tileAddr + line * 2]; //byte 1 of tile
-        uint8_t byte2 = *memoryMap[tileAddr + line * 2 + 1]; //byte 2 of tile
-
-        // Column inside tile (0–7), extract pixel bits from MSB to LSB
-        uint8_t bitIndex = 7 - (mapX % 8);
-        uint8_t lo = (byte1 >> bitIndex) & 0x01;
-        uint8_t hi = (byte2 >> bitIndex) & 0x01;
-        uint8_t colourId = (hi << 1) | lo;
-
-        // Apply palette (each 2 bits in BGP maps colorId to grayscale color 0-3)
-        uint8_t colour = (bgp >> (colourId * 2)) & 0x03;
-
-        // Write pixel to framebuffer
-        displayBuffer[ly][x] = colour;
-    }
-} */
